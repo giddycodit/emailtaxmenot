@@ -1,0 +1,29 @@
+name: Run emailtaxmenot preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      email:
+        description: 'Yahoo email address'
+        required: true
+        default: 'kirstenkissmeyer@yahoo.com'
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install imapclient
+      - name: Run preview
+        env:
+          YAHOO_APP_PASSWORD: ${{ secrets.YAHOO_APP_PASSWORD }}
+        run: |
+          python emailtaxmenot.py ${{ github.event.inputs.email }} preview
