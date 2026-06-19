@@ -1,4 +1,6 @@
+from http import server
 import os
+from pyexpat.errors import messages
 import sys
 import getpass
 import traceback
@@ -9,19 +11,24 @@ import time
 
 ACCOUNT_CONFIG = {
   "yahoo.com": {
-    "imap_server": "export.imap.mail.yahoo.com",
-    "imap_port": 993,
+    "imap_server_read": "export.imap.mail.yahoo.com",
+    "imap_server_write": "imap.mail.yahoo.com",
+    "imap_port_read": 993,
+    "imap_port_write": 993,
     "inbox": ["Inbox", "INBOX"],
     "trash": "Trash",
   },
   "gmail.com": {
-    "imap_server": "imap.gmail.com",
-    "imap_port": 993,
+    "imap_server_read": "imap.gmail.com",
+    "imap_server_write": "imap.gmail.com",
+    "imap_port_read": 993,
+    "imap_port_write": 993,
     "inbox": ["INBOX", "Inbox"],
     "trash": "[Gmail]/Trash",
   },
 }
-
+server = None
+server_write = None
 
 # Safety Adjustments
 CHUNK_SIZE = 500  # Number of emails moved per batch
@@ -65,21 +72,186 @@ def select_inbox_folder(server, inbox_candidates):
     f"Unable to select the Inbox folder with any of: {', '.join(inbox_candidates)}"
   )
 
-import datetime
-import time
 
 # Safety Adjustments (Ensure these are defined globally in your script)
 CHUNK_SIZE = 500
 PAUSE_BETWEEN_CHUNKS = 1.5
 
-import datetime
-import time
+def get_folder_status(server, to_folder):
+  if not server.folder_exists(to_folder):
+      print(f"get_folder_status: Folder '{to_folder}' does not exist. Returning ...")
+      return -1
+          
+# Inline status check for the Trash folder count
+  try:
+      to_folder_status = server.folder_status(to_folder, ["MESSAGES"])
+      to_folder_count = to_folder_status[b"MESSAGES"]
+        # Handle library variance for byte vs string key dictionary mapping
+      to_folder_count = to_folder_status.get(b"MESSAGES") or to_folder_status.get("MESSAGES", 0)
+      #if you select the folder you can also get count using - total_emails = folder_info['EXISTS'] 
+      print(f"get_folder_status: Current messages in {to_folder}: {to_folder_count:,}")
+      return to_folder_count  
+  
+  except Exception:
+      print(f"Unable to determine message count for  folder '{to_folder}'.")
+      return -1
+   
+def create_folder_if_not_exists(server, folder_name): 
+    try:
+        if server.folder_exists(folder_name):
+            print(f"Folder '{folder_name}' already exists.")
+            return
+        
+        server.create_folder(folder_name)
+        print(f"Folder '{folder_name}' created successfully.")
+    except Exception as e:
+        print(f"Error occurred while creating folder '{folder_name}': {e}")
 
-# Safety Adjustments (Ensure these are defined globally in your script)
-CHUNK_SIZE = 500
-PAUSE_BETWEEN_CHUNKS = 1.5
 
-def move_unsubscribe_emails_to_trashallatonce(server, inbox_candidates, trash_folder, limit=10000):
+def move_messages_to_folder(server, messages, from_folder, to_folder, create_folder=True, chunk_size=CHUNK_SIZE, prompt_user=True, limit=None):
+  
+  print(f"\nmove_messages_to_folder: {from_folder} -> {to_folder}.")
+  
+  if create_folder:
+    create_folder_if_not_exists(server, to_folder)
+
+  total_messages = len(messages)
+  
+  # Convert to a set to remove duplicates, then back to a sorted list
+  unique_messages = sorted(list(set(messages)))
+
+  print(f"Messages to move: {len(messages):,}")
+  messages = unique_messages
+
+  total_messages = len(messages)
+  print(f"Total unique messages to move: {total_messages:,}")
+
+  if total_messages == 0:
+      print("No messages to move. Returning")
+      return
+      
+  # 3. Apply the user-defined safety cap limit if needed
+  if limit is not None and total_messages > limit:
+      messages = messages[:limit]
+      total_messages = len(messages)
+      print(f"Limiting movement execution to the first {limit:,} messages.")
+
+
+  # ==================== YOUR USER INTERACTIVE PROMPT ====================
+  if prompt_user:
+    print(f"\n⚠️ WARNING: You are about to move {total_messages:,} emails to the folder'{to_folder}. You can review them there. " )
+    user_confirmation = input("Are you sure you want to proceed? Type 'Yes' to continue: ")
+    
+    if user_confirmation.strip() != "Yes":
+        print("Operation cancelled by user. No emails were moved.")
+        return
+  # =======================================================================
+  to_folder_count = get_folder_status(server, to_folder)
+
+  # 4. Chunked movement loop with the 1.5-second anti-ban pause
+  print(f"\nStarting chunked migration to {to_folder}...")
+  for i in range(0, total_messages, chunk_size):
+      chunk = messages[i:i + chunk_size]
+      
+      # Atomically copy to Trash and mark original as deleted
+      server_write.move(chunk, to_folder)
+      print(f"Moved batch starting at index {i:,} ({len(chunk)} emails) to {to_folder}")
+      
+      # Critical safety pause to stay under Yahoo's command-frequency firewall thresholds
+      time.sleep(PAUSE_BETWEEN_CHUNKS)
+      
+  print(
+      f"\nEmails moved to folder {to_folder}. "
+      "You can now review them there.  "     
+  )
+  
+  server_write.noop()  # Refresh server state after moving messages
+  server.noop()  # Refresh server state after moving messages
+
+  # 5. Inline status check for the Trash folder count
+  try:
+      to_folder_count = get_folder_status(server, to_folder)
+      if to_folder_count < total_messages:
+        print("ℹ️ Note: Yahoo server-side indexing can lag causing the count to be inaccurate.")
+        print("The emails are safe; log into mail.yahoo.com to see the fully updated tally.")
+
+  except Exception:
+      print(f"Unable to determine message count for  folder '{to_folder}'.")
+
+
+
+def move_all_folder_messages(server, from_folder, to_folder, chunk_size=500):
+    """
+    Fetches all UIDs once to prevent Yahoo index fragmentation bugs, 
+    then moves them in cautious batches with error retries.
+    """
+    # 1. Select the source folder
+    try:
+
+        print(f"Opened '{from_folder}'. ")
+        total_messages = get_folder_status(server, from_folder)
+        print(f"Total messages in '{from_folder}': {total_messages}")   
+        if total_messages == 0:
+            print("Folder is empty.")
+            return
+        server.select_folder(from_folder, readonly=False)
+
+    except Exception as e:
+        print(f"Error selecting source folder '{from_folder}': {e}")
+        return
+
+    # 2. Fetch ALL static UIDs right now so we don't rely on shifting indexes
+    print("Fetching absolute UID list from Yahoo... (This stays stable)")
+    all_uids = server.search(['ALL'])
+    total_emails = len(all_uids)
+    print(f"Successfully indexed {total_emails} messages to move.")
+
+    if total_emails == 0:
+        print("Folder is empty.")
+        return 0
+
+    total_moved = 0
+
+    # 3. Slice the stable Python list of UIDs into blocks
+    for i in range(0, total_emails, chunk_size):
+        chunk = all_uids[i : i + chunk_size]
+        
+        # Retry loop specifically designed to beat Yahoo's [SERVERBUG]
+        retries = 3
+        while retries > 0:
+            try:
+                print(f"Moving chunk {i//chunk_size + 1} ({len(chunk)} emails)...")
+                
+                # Move this explicit batch of permanent IDs
+                server.move(chunk, to_folder)
+                
+                total_moved += len(chunk)
+                
+                # CRITICAL: Cooldown gives Yahoo's database time to re-index rows
+                time.sleep(1.5) 
+                break # Success, exit retry loop
+                
+            except Exception as e:
+                retries -= 1
+                error_str = str(e)
+                print(f" -> Yahoo Server Hitch: {error_str}")
+                
+                if "SERVERBUG" in error_str or "try again later" in error_str:
+                    print(f" -> Pausing 5 seconds to let Yahoo recover. Retries left: {retries}")
+                    time.sleep(5)
+                else:
+                    print(" -> Non-recoverable error. Stopping.")
+                    return
+
+        if retries == 0:
+            print("\n[Fatal] Yahoo refused to clear this chunk after multiple retries. Stopping.")
+            return
+
+    print(f"\nProcessing complete! Successfully migrated {total_moved} emails to '{to_folder}'.")
+    return total_moved
+
+
+def move_unsubscribe_emails_to_trash2(server, inbox_candidates, trash_folder, limit=10000):
     # 1. Dynamically find and select the Inbox from candidates
     selected_folder = None
     for folder in inbox_candidates:
@@ -89,7 +261,7 @@ def move_unsubscribe_emails_to_trashallatonce(server, inbox_candidates, trash_fo
             
     if not selected_folder:
         print("Error: Could not find a valid Inbox folder from candidates.")
-        return
+        return 0
 
     # Select the inbox in read/write mode so we can move items out of it
     server.select_folder(selected_folder, readonly=False)
@@ -105,65 +277,73 @@ def move_unsubscribe_emails_to_trashallatonce(server, inbox_candidates, trash_fo
     
     # Track the absolute lowest UID found across the entire run to use as an upper boundary
     lowest_uid_marker = None
-
+    year_marker = None
     currentYearCount = 0
     # Loops backward from the current year all the way down to 1997
-    for year in [current_year]:  #range(current_year, FIRST_POSSIBLE_YEAR - 1, -1):
+    for year in range(current_year, FIRST_POSSIBLE_YEAR - 1, -1):
+    #for year in [FIRST_POSSIBLE_YEAR]:
         print(f"Scanning year {year} for matching emails...")
         
         # Internal control flags to paginate years containing more than 1,000 matches
         year_complete = False
-        year_marker = None #lowest_uid_marker
+        #year_marker = None #lowest_uid_marker
         currentYearCount = 0
-
+        year_marker = None
+        last_current_max = None
+        
         while not year_complete:
             since_date = f"01-Jan-{year}"
             before_date = f"01-Jan-{year + 1}"
 
             # Explicitly quote '"unsubscribe"' so Yahoo parses the search text properly
-            search_criteria = ['BODY', 'unsubscribe'] #,'SINCE', since_date, 'BEFORE', before_date ]
+            search_criteria = ['BODY', '"unsubscribe"','SINCE', since_date  ]
+            #search_criteria = ['BODY', '"unsubscribe"']
             
-            
-            # Only inject the ceiling restriction if we have a valid, active marker
-            if year_marker is not None:
-                search_criteria.extend(['UID', f"1:{year_marker - 1}"])
             
             try:
                 doneWithYear = False
                 while not doneWithYear:
+                  search_criteria = ['BODY', '"unsubscribe"','SINCE', since_date  ]
+                  # Only inject the ceiling restriction if we have a valid, active marker
+                  if year_marker is not None:
+                      # Instead, define sliding chunk boundaries dynamically inside your loop loop:
+                      #search_low = year_marker - 5000
+                      uid_search_range = f"1:{year_marker-1}"
+                      #uid_search_range = f"{current_max + 1}:{current_max+500}"
+                      last_current_max = current_max
+                      #print(f"Scanning UID range: {uid_search_range}")
+                      #search_criteria.extend(['UID', uid_search_range])
+                      #search_criteria = f"['UID', '{uid_search_range}']"  
+
+                  
+
+                  print(f"Searching with criteria: {search_criteria} ")
+
+                    #yearly_matches = server.search(search_criteria)        
                   # This forces Yahoo to scan only one narrow window block at a time
                   yearly_matches = server.search(search_criteria)
                   
-                  if isinstance(yearly_matches, list) and yearly_matches:
+                  if isinstance(yearly_matches, list) and yearly_matches and len(yearly_matches) > 0:
                       messages.extend(yearly_matches)
                       count_found = len(yearly_matches)
+                      currentYearCount += count_found
 
 
 
                       # Update local tracking variables with the smallest tracking pointer found
                       current_min = min(yearly_matches)
                       current_max = max(yearly_matches)
+                      year_marker = current_min
+                      lowest_uid_marker = current_min
                       
-                      
-                      print(f"current_min: {current_min}, current_max: {current_max},  lowest_uid_marker: {lowest_uid_marker}, year: {year}  ")
-                      if year_marker:
-                          print(f" -> Using year_marker: {year_marker}")
-                      if lowest_uid_marker is None or current_min < lowest_uid_marker:
-                          lowest_uid_marker = current_min
-                          print(f" -> Found {count_found:,}  matches for year {year}")
-                          currentYearCount += count_found
-                          year_marker = current_min
-                      else:
-                         doneWithYear = True
-                      
-                      # CRITICAL DETECTION: If it's exactly 1,000, Yahoo hit its response limit.
-                      # Loop again within the same year using our updated year_marker ceiling.
-                      #if count_found == 1000:
-                      #    print(f" -> Found 1,000 matches (Limit hit. Paging deeper into year {year}...)")
-                      #    time.sleep(0.3)  # Micro-break to keep connections stable
-                      #else:``
-                      #    print(f" -> Found {count_found:,} final matches for year {year}")
-                      #    year_complete = True
+                      print(f"returned results: found: {count_found},  current_min: {current_min}, current_max: {current_max},  lowest_uid_marker: {lowest_uid_marker}, since year: {year}  ")
+                      #if year_marker:
+                      print(f" Updated year_marker value: {year_marker}")
+
+                      if last_current_max == current_max:
+                          print(f"Warning: UID pagination appears to be stuck at {current_max}. Ending year scan to prevent infinite loop.")
+                          doneWithYear = True
+
                   else:
                       #if year_marker == lowest_uid_marker:
                       if currentYearCount == 0:
@@ -173,66 +353,33 @@ def move_unsubscribe_emails_to_trashallatonce(server, inbox_candidates, trash_fo
                   if doneWithYear:
                       year_complete = True
                       print(f" -> Found {currentYearCount} final matches for year {year}")
-                      currentYearCount = 0
+                      
                       
                   # Quick 0.5-second rest between operations to keep the connection rock stable
                   time.sleep(0.5)
                 
+                  move_messages_to_folder(server, messages, "Inbox", "Pre Trash", True, CHUNK_SIZE, False , 2000)
+                  # Close out the current folder view session to kill stale server memory pointers
+                  server.close_folder()
+                  server.noop()
+                  server.select_folder(selected_folder, readonly=False)
+                  total_messages += len(messages)
+                  messages = []
+                  
             except Exception as e:
                 print(f"Warning: Scan interrupted at year {year}. Error: {e}")
                 year_complete = True
                 break
 
-    total_messages = len(messages)
+    
     print(f"\nSearch complete. Total 'unsubscribe' emails found across all years: {total_messages:,}")
     
-    if total_messages == 0:
-        print("No messages with unsubscribe found in Inbox.")
-        return
+    return total_messages
         
-    # 3. Apply the user-defined safety cap limit if needed
-    if limit is not None and total_messages > limit:
-        messages = messages[:limit]
-        total_messages = len(messages)
-        print(f"Limiting movement execution to the first {limit:,} messages.")
+    #move_messages_to_folder(server, messages, "Inbox", "Pre Trash", True, CHUNK_SIZE, True, 2000)
 
-    # ==================== YOUR USER INTERACTIVE PROMPT ====================
-    print(f"\n⚠️ WARNING: You are about to move {total_messages:,} emails to the '{trash_folder}. You can review them there. " \
-            f"\nKeep in mind that the Trash may be automatically permanently deleted by your email provider periodically.' folder.")
-    user_confirmation = input("Are you sure you want to proceed? Type 'Yes' to continue: ")
-    
-    if user_confirmation.strip() != "Yes":
-        print("Operation cancelled by user. No emails were moved.")
-        return
-    # =======================================================================
-        
-    # 4. Chunked movement loop with the 1.5-second anti-ban pause
-    print(f"\nStarting chunked migration to {trash_folder}...")
-    for i in range(0, total_messages, CHUNK_SIZE):
-        chunk = messages[i:i + CHUNK_SIZE]
-        
-        # Atomically copy to Trash and mark original as deleted
-        server.move(chunk, trash_folder)
-        print(f"Moved batch starting at index {i:,} ({len(chunk)} emails) to {trash_folder}")
-        
-        # Critical safety pause to stay under Yahoo's command-frequency firewall thresholds
-        time.sleep(PAUSE_BETWEEN_CHUNKS)
-        
-    print(
-        f"\nEmails with 'unsubscribe' moved to {trash_folder}. "
-        "You can now review them there. You can move any you do not want to delete into another folder. "
-        "Then you can empty the Trash folder and lower your email storage!"
-    )
-    
-    # 5. Inline status check for the Trash folder count
-    try:
-        trash_status = server.folder_status(trash_folder, ["MESSAGES"])
-        trash_count = trash_status[b"MESSAGES"]
-        print(f"Current messages in {trash_folder}: {trash_count:,}")
-    except Exception:
-        print(f"Unable to determine message count for Trash folder '{trash_folder}'.")
 
-def move_unsubscribe_emails_to_trash2(server, inbox_candidates, trash_folder, limit=10000):
+def move_unsubscribe_emails_to_trash2_1(server, inbox_candidates, trash_folder, limit=10000):
     # 1. Dynamically find and select the Inbox from candidates
     selected_folder = None
     for folder in inbox_candidates:
@@ -361,7 +508,8 @@ def move_unsubscribe_emails_to_trash2(server, inbox_candidates, trash_folder, li
         print("Operation cancelled by user. No emails were moved.")
         return
     # =======================================================================
-        
+    #move_messages_to_folder(server, messages, "Inbox", to_folder, create_folder=True, chunk_size=1000, prompt_user=False, limit=limit):
+
     # 4. Chunked movement loop with the 1.5-second anti-ban pause
     print(f"\nStarting chunked migration to {trash_folder}...")
     for i in range(0, total_messages, CHUNK_SIZE):
@@ -511,7 +659,7 @@ def move_unsubscribe_emails_to_trash(server, inbox_candidates, trash_folder, lim
   )
 
   # show current trash count after moving so user can decide about emptying
-  trash_count = get_folder_count(server, trash_folder)
+  trash_count = get_folder_status(server, trash_folder)
   if trash_count is None:
     print(f"Unable to determine message count for Trash folder '{trash_folder}'.")
   else:
@@ -586,7 +734,7 @@ def search_in_uid_ranges(server, search_criteria, chunk_size=CHUNK_SIZE, folder_
   return sorted(set(messages))
 
 
-def get_folder_count_using_uid_pagination(server, folder_name, chunk_size=10000):
+def get_folder_status_using_uid_pagination(server, folder_name, chunk_size=10000):
   total = 0
   start = 1
   uidnext = None
@@ -622,7 +770,7 @@ def get_folder_count_using_uid_pagination(server, folder_name, chunk_size=10000)
   return total
 
 
-def get_folder_counts(server, folder_name):
+def get_folder_statuss(server, folder_name):
   total = 0
   unread = 0
 
@@ -657,7 +805,7 @@ def get_folder_counts(server, folder_name):
 
   if total == 10000:
     try:
-      total = get_folder_count_using_uid_pagination(server, folder_name)
+      total = get_folder_status_using_uid_pagination(server, folder_name)
     except Exception:
       pass
 
@@ -682,7 +830,7 @@ def preview_unsubscribe_emails_with_trash(server, inbox_candidates, trash_folder
   selected_folder = select_inbox_folder(server, inbox_candidates)
   print(f"Selected folder: {selected_folder}")
 
-  inbox_total = get_folder_count(server, selected_folder)
+  inbox_total = get_folder_status(server, selected_folder)
   if inbox_total is None:
     print(f"Unable to determine total messages in Inbox folder '{selected_folder}'.")
   else:
@@ -697,7 +845,7 @@ def preview_unsubscribe_emails_with_trash(server, inbox_candidates, trash_folder
     print("No messages with unsubscribe found in Inbox.")
 
   # show current Trash count (heads-up)
-  trash_count = get_folder_count(server, trash_folder)
+  trash_count = get_folder_status(server, trash_folder)
   if trash_count is None:
     print(f"Unable to determine message count for Trash folder '{trash_folder}'.")
   else:
@@ -714,7 +862,7 @@ def summarize_folders(server):
   print(f"Found {len(folders)} folders. Scanning each folder...")
   for flags, delimiter, folder_name in folders:
     try:
-      total, unread = get_folder_counts(server, folder_name)
+      total, unread = get_folder_statuss(server, folder_name)
       unsubscribe_count=-2
       #unsubscribe_count = len(search_in_uid_ranges(server, ["TEXT", "unsubscribe"], folder_name=folder_name))
       print(
@@ -743,6 +891,7 @@ def  empty_trash_folder2(server, trash_folder):
       return
 
     try:
+        
         # 1. Open the Trash folder in read/write mode
         server.select_folder(trash_folder, readonly=False)
         print(f"\nOpened {trash_folder} for permanent purging...")
@@ -801,7 +950,7 @@ def main():
   email = sys.argv[1].lower()
   action = sys.argv[2].lower()
 
-  if action not in {"preview", "clean", "empty", "summary"}:
+  if action not in {"preview", "clean","trash", "empty", "summary"}:
     print(f"Unknown action: {action}")
     print_usage()
     sys.exit(1)
@@ -827,20 +976,26 @@ def main():
     sys.exit(1)
 
   try:
-    with login_to_imap(email, config["imap_server"], config["imap_port"]) as server:
-      if action == "preview":
-        preview_unsubscribe_emails_with_trash(server, config["inbox"], config["trash"])
-      elif action == "clean":
-        move_unsubscribe_emails_to_trash2(
-          server,
-          config["inbox"],
-          config["trash"],
-          limit,
-        )
-      elif action == "summary":
-        summarize_folders(server)
-      else:
-        empty_trash_folder2(server, config["trash"])
+    server =  login_to_imap(email, config["imap_server_read"], config["imap_port_read"])
+    server_write = login_to_imap(email, config["imap_server_write"], config["imap_port_write"])
+    if action == "preview":
+      preview_unsubscribe_emails_with_trash(server, config["inbox"], config["trash"])
+    elif action == "trash":
+      while True:
+        total_moved = move_all_folder_messages(server, "Pre Trash", config["trash"])
+        if total_moved == 0:
+          break
+    elif action == "clean":
+      move_unsubscribe_emails_to_trash2(
+        server,
+        config["inbox"],
+        "Pre Trash",
+        limit,
+      )
+    elif action == "summary":
+      summarize_folders(server)
+    else:
+      empty_trash_folder2(server, config["trash"])
   except Exception as error:
     print(f"\nUhoh! An exception occurred: {error}")
     traceback.print_exc()
