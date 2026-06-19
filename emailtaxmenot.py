@@ -154,7 +154,7 @@ def move_messages_to_folder(server, messages, from_folder, to_folder, create_fol
       chunk = messages[i:i + chunk_size]
       
       # Atomically copy to Trash and mark original as deleted
-      server_write.move(chunk, to_folder)
+      server.move(chunk, to_folder)
       print(f"Moved batch starting at index {i:,} ({len(chunk)} emails) to {to_folder}")
       
       # Critical safety pause to stay under Yahoo's command-frequency firewall thresholds
@@ -165,7 +165,7 @@ def move_messages_to_folder(server, messages, from_folder, to_folder, create_fol
       "You can now review them there.  "     
   )
   
-  server_write.noop()  # Refresh server state after moving messages
+  #server_write.noop()  # Refresh server state after moving messages
   server.noop()  # Refresh server state after moving messages
 
   # 5. Inline status check for the Trash folder count
@@ -270,6 +270,7 @@ def move_unsubscribe_emails_to_trash2(server, inbox_candidates, trash_folder, li
     # 2. Execute a universal, year-by-year search with intra-year pagination
     print("Executing historical index search for 'unsubscribe'...")
     messages = []
+    total_messages = 0
 
     # Dynamically get the current year and stop at Yahoo Mail's birth year
     current_year = datetime.datetime.now().year
@@ -357,14 +358,24 @@ def move_unsubscribe_emails_to_trash2(server, inbox_candidates, trash_folder, li
                       
                   # Quick 0.5-second rest between operations to keep the connection rock stable
                   time.sleep(0.5)
-                
-                  move_messages_to_folder(server, messages, "Inbox", "Pre Trash", True, CHUNK_SIZE, False , 2000)
+                  num_messages = len(messages)
+                  
+                  remaining_limit = limit - total_messages
+                  move_limit = None
+                  if num_messages > remaining_limit:
+                      move_limit = remaining_limit
+                      total_messages += move_limit
+                  else:
+                     total_messages += num_messages
+                  move_messages_to_folder(server, messages, "Inbox", "Pre Trash", True, CHUNK_SIZE, False , move_limit)
                   # Close out the current folder view session to kill stale server memory pointers
                   server.close_folder()
                   server.noop()
                   server.select_folder(selected_folder, readonly=False)
-                  total_messages += len(messages)
                   messages = []
+                  if move_limit is not None:
+                      print(f"Reached user-defined limit of {limit} messages. Stopping search.")
+                      return total_messages
                   
             except Exception as e:
                 print(f"Warning: Scan interrupted at year {year}. Error: {e}")
@@ -884,11 +895,7 @@ def  empty_trash_folder2(server, trash_folder):
     Safely purges the Trash folder in manageable blocks to prevent 
     Yahoo connection bans while permanently wiping out storage space.
     """
-    print("WARNING: Emptying Trash will permanently delete all messages in the Trash folder.")
-    confirmation = input("Type 'Yes' to proceed: ")
-    if confirmation != "Yes":
-      print("Aborting empty action.")
-      return
+  
 
     try:
         
@@ -906,8 +913,13 @@ def  empty_trash_folder2(server, trash_folder):
         
         if total_in_trash == 0:
             print("Trash folder is already empty.")
-            return
-
+            return 0
+        print("WARNING: Emptying Trash will permanently delete all messages in the Trash folder.")
+        confirmation = input("Type 'Yes' to proceed: ")
+        if confirmation != "Yes":
+          print("Aborting empty action.")
+          return 0
+        
         # 3. Loop through the Trash UIDs in safe chunks
         print(f"Beginning permanent purge (Chunk Size: {DELETE_CHUNK_SIZE})...")
         for i in range(0, total_in_trash, DELETE_CHUNK_SIZE):
@@ -926,7 +938,8 @@ def  empty_trash_folder2(server, trash_folder):
             time.sleep(PAUSE_BETWEEN_DELETES)
             
         print(f"🏁 Done! The {trash_folder} folder has been permanently emptied.")
-        
+        return total_in_trash
+    
     except Exception as e:
         print(f"An error occurred while emptying trash: {e}")
 
@@ -935,9 +948,13 @@ def print_usage():
   print("Usage: python emailtaxmenot.py <youremail@domain.com> <action> [limit]")
   print("Actions:")
   print("  preview - count 'unsubscribe' messages in Inbox without moving anything")
-  print("  clean   - move 'unsubscribe' emails from Inbox to Trash")
+  print("  clean   - move 'unsubscribe' emails from Inbox to 'Pre Trash' folder")
   print("            optional [limit] sets the maximum number of messages to move")
-  print("  empty   - permanently delete all messages in Trash")
+  print("            if you want to review the emails in 'Pre Trash'")
+  print("            it is recommended to use a limit of 5000 at a time")
+  print("            preview the emails in 'Pre Trash', move any you do not want to delete, and then run 'trash'")
+  print("  trash   - move 'Pre Trash' messages to Trash")
+  print("  empty   - permanently deletes all messages in Trash")
   print("  summary - list all folders with total, unread, and unsubscribe counts")
 
 
@@ -977,7 +994,8 @@ def main():
 
   try:
     server =  login_to_imap(email, config["imap_server_read"], config["imap_port_read"])
-    server_write = login_to_imap(email, config["imap_server_write"], config["imap_port_write"])
+    #server_write = server
+    #server_write = login_to_imap(email, config["imap_server_write"], config["imap_port_write"])
     if action == "preview":
       preview_unsubscribe_emails_with_trash(server, config["inbox"], config["trash"])
     elif action == "trash":
@@ -986,16 +1004,27 @@ def main():
         if total_moved == 0:
           break
     elif action == "clean":
-      move_unsubscribe_emails_to_trash2(
-        server,
-        config["inbox"],
-        "Pre Trash",
-        limit,
-      )
+      remaining_limit = limit
+      while True:
+        moved_count = move_unsubscribe_emails_to_trash2(
+          server,
+          config["inbox"],
+          "Pre Trash",
+          remaining_limit,
+        )
+        if moved_count == 0:
+          break
+        remaining_limit -= moved_count
+        if remaining_limit <= 0:
+           break
     elif action == "summary":
       summarize_folders(server)
     else:
-      empty_trash_folder2(server, config["trash"])
+      while True:
+        total_deleted = empty_trash_folder2(server, config["trash"])
+        if total_deleted == 0:
+          break
+
   except Exception as error:
     print(f"\nUhoh! An exception occurred: {error}")
     traceback.print_exc()
