@@ -65,10 +65,331 @@ def select_inbox_folder(server, inbox_candidates):
     f"Unable to select the Inbox folder with any of: {', '.join(inbox_candidates)}"
   )
 
+import datetime
+import time
+
+# Safety Adjustments (Ensure these are defined globally in your script)
+CHUNK_SIZE = 500
+PAUSE_BETWEEN_CHUNKS = 1.5
+
+import datetime
+import time
+
+# Safety Adjustments (Ensure these are defined globally in your script)
+CHUNK_SIZE = 500
+PAUSE_BETWEEN_CHUNKS = 1.5
+
+def move_unsubscribe_emails_to_trashallatonce(server, inbox_candidates, trash_folder, limit=10000):
+    # 1. Dynamically find and select the Inbox from candidates
+    selected_folder = None
+    for folder in inbox_candidates:
+        if server.folder_exists(folder):
+            selected_folder = folder
+            break
+            
+    if not selected_folder:
+        print("Error: Could not find a valid Inbox folder from candidates.")
+        return
+
+    # Select the inbox in read/write mode so we can move items out of it
+    server.select_folder(selected_folder, readonly=False)
+    print(f"Selected folder: {selected_folder}")
+    
+    # 2. Execute a universal, year-by-year search with intra-year pagination
+    print("Executing historical index search for 'unsubscribe'...")
+    messages = []
+
+    # Dynamically get the current year and stop at Yahoo Mail's birth year
+    current_year = datetime.datetime.now().year
+    FIRST_POSSIBLE_YEAR = 1997 
+    
+    # Track the absolute lowest UID found across the entire run to use as an upper boundary
+    lowest_uid_marker = None
+
+    currentYearCount = 0
+    # Loops backward from the current year all the way down to 1997
+    for year in [current_year]:  #range(current_year, FIRST_POSSIBLE_YEAR - 1, -1):
+        print(f"Scanning year {year} for matching emails...")
+        
+        # Internal control flags to paginate years containing more than 1,000 matches
+        year_complete = False
+        year_marker = None #lowest_uid_marker
+        currentYearCount = 0
+
+        while not year_complete:
+            since_date = f"01-Jan-{year}"
+            before_date = f"01-Jan-{year + 1}"
+
+            # Explicitly quote '"unsubscribe"' so Yahoo parses the search text properly
+            search_criteria = ['BODY', 'unsubscribe'] #,'SINCE', since_date, 'BEFORE', before_date ]
+            
+            
+            # Only inject the ceiling restriction if we have a valid, active marker
+            if year_marker is not None:
+                search_criteria.extend(['UID', f"1:{year_marker - 1}"])
+            
+            try:
+                doneWithYear = False
+                while not doneWithYear:
+                  # This forces Yahoo to scan only one narrow window block at a time
+                  yearly_matches = server.search(search_criteria)
+                  
+                  if isinstance(yearly_matches, list) and yearly_matches:
+                      messages.extend(yearly_matches)
+                      count_found = len(yearly_matches)
 
 
+
+                      # Update local tracking variables with the smallest tracking pointer found
+                      current_min = min(yearly_matches)
+                      current_max = max(yearly_matches)
+                      
+                      
+                      print(f"current_min: {current_min}, current_max: {current_max},  lowest_uid_marker: {lowest_uid_marker}, year: {year}  ")
+                      if year_marker:
+                          print(f" -> Using year_marker: {year_marker}")
+                      if lowest_uid_marker is None or current_min < lowest_uid_marker:
+                          lowest_uid_marker = current_min
+                          print(f" -> Found {count_found:,}  matches for year {year}")
+                          currentYearCount += count_found
+                          year_marker = current_min
+                      else:
+                         doneWithYear = True
+                      
+                      # CRITICAL DETECTION: If it's exactly 1,000, Yahoo hit its response limit.
+                      # Loop again within the same year using our updated year_marker ceiling.
+                      #if count_found == 1000:
+                      #    print(f" -> Found 1,000 matches (Limit hit. Paging deeper into year {year}...)")
+                      #    time.sleep(0.3)  # Micro-break to keep connections stable
+                      #else:``
+                      #    print(f" -> Found {count_found:,} final matches for year {year}")
+                      #    year_complete = True
+                  else:
+                      #if year_marker == lowest_uid_marker:
+                      if currentYearCount == 0:
+                          print(f" -> No matches found in year {year}")
+                      doneWithYear = True
+
+                  if doneWithYear:
+                      year_complete = True
+                      print(f" -> Found {currentYearCount} final matches for year {year}")
+                      currentYearCount = 0
+                      
+                  # Quick 0.5-second rest between operations to keep the connection rock stable
+                  time.sleep(0.5)
+                
+            except Exception as e:
+                print(f"Warning: Scan interrupted at year {year}. Error: {e}")
+                year_complete = True
+                break
+
+    total_messages = len(messages)
+    print(f"\nSearch complete. Total 'unsubscribe' emails found across all years: {total_messages:,}")
+    
+    if total_messages == 0:
+        print("No messages with unsubscribe found in Inbox.")
+        return
+        
+    # 3. Apply the user-defined safety cap limit if needed
+    if limit is not None and total_messages > limit:
+        messages = messages[:limit]
+        total_messages = len(messages)
+        print(f"Limiting movement execution to the first {limit:,} messages.")
+
+    # ==================== YOUR USER INTERACTIVE PROMPT ====================
+    print(f"\n⚠️ WARNING: You are about to move {total_messages:,} emails to the '{trash_folder}. You can review them there. " \
+            f"\nKeep in mind that the Trash may be automatically permanently deleted by your email provider periodically.' folder.")
+    user_confirmation = input("Are you sure you want to proceed? Type 'Yes' to continue: ")
+    
+    if user_confirmation.strip() != "Yes":
+        print("Operation cancelled by user. No emails were moved.")
+        return
+    # =======================================================================
+        
+    # 4. Chunked movement loop with the 1.5-second anti-ban pause
+    print(f"\nStarting chunked migration to {trash_folder}...")
+    for i in range(0, total_messages, CHUNK_SIZE):
+        chunk = messages[i:i + CHUNK_SIZE]
+        
+        # Atomically copy to Trash and mark original as deleted
+        server.move(chunk, trash_folder)
+        print(f"Moved batch starting at index {i:,} ({len(chunk)} emails) to {trash_folder}")
+        
+        # Critical safety pause to stay under Yahoo's command-frequency firewall thresholds
+        time.sleep(PAUSE_BETWEEN_CHUNKS)
+        
+    print(
+        f"\nEmails with 'unsubscribe' moved to {trash_folder}. "
+        "You can now review them there. You can move any you do not want to delete into another folder. "
+        "Then you can empty the Trash folder and lower your email storage!"
+    )
+    
+    # 5. Inline status check for the Trash folder count
+    try:
+        trash_status = server.folder_status(trash_folder, ["MESSAGES"])
+        trash_count = trash_status[b"MESSAGES"]
+        print(f"Current messages in {trash_folder}: {trash_count:,}")
+    except Exception:
+        print(f"Unable to determine message count for Trash folder '{trash_folder}'.")
 
 def move_unsubscribe_emails_to_trash2(server, inbox_candidates, trash_folder, limit=10000):
+    # 1. Dynamically find and select the Inbox from candidates
+    selected_folder = None
+    for folder in inbox_candidates:
+        if server.folder_exists(folder):
+            selected_folder = folder
+            break
+            
+    if not selected_folder:
+        print("Error: Could not find a valid Inbox folder from candidates.")
+        return
+
+    # Select the inbox in read/write mode so we can move items out of it
+    server.select_folder(selected_folder, readonly=False)
+    print(f"Selected folder: {selected_folder}")
+    
+    # 2. Execute a universal, year-by-year search with intra-year pagination
+    print("Executing historical index search for 'unsubscribe'...")
+    messages = []
+
+    # Dynamically get the current year and stop at Yahoo Mail's birth year
+    current_year = datetime.datetime.now().year
+    FIRST_POSSIBLE_YEAR = 1997 
+    
+    # Track the absolute lowest UID found across the entire run to use as an upper boundary
+    lowest_uid_marker = None
+    year_marker = None
+    currentYearCount = 0
+    # Loops backward from the current year all the way down to 1997
+    for year in range(current_year, FIRST_POSSIBLE_YEAR - 1, -1):
+        print(f"Scanning year {year} for matching emails...")
+        
+        # Internal control flags to paginate years containing more than 1,000 matches
+        year_complete = False
+        #year_marker = None #lowest_uid_marker
+        currentYearCount = 0
+        year_marker = None
+        
+        while not year_complete:
+            since_date = f"01-Jan-{year}"
+            before_date = f"01-Jan-{year + 1}"
+
+            # Explicitly quote '"unsubscribe"' so Yahoo parses the search text properly
+            search_criteria = ['BODY', '"unsubscribe"','SINCE', since_date  ]
+            
+            
+            
+            try:
+                doneWithYear = False
+                while not doneWithYear:
+                  # Only inject the ceiling restriction if we have a valid, active marker
+                  if year_marker is not None:
+                      # Instead, define sliding chunk boundaries dynamically inside your loop loop:
+                      search_low = year_marker - 5000
+                      uid_search_range = f"1:{year_marker-1}"
+                      print(f"Scanning UID range: {uid_search_range}")
+                      search_criteria.extend(['UID', uid_search_range])
+        
+                  # This forces Yahoo to scan only one narrow window block at a time
+                  yearly_matches = server.search(search_criteria)
+                  
+                  if isinstance(yearly_matches, list) and yearly_matches:
+                      messages.extend(yearly_matches)
+                      count_found = len(yearly_matches)
+                      currentYearCount += count_found
+
+
+
+                      # Update local tracking variables with the smallest tracking pointer found
+                      current_min = min(yearly_matches)
+                      current_max = max(yearly_matches)
+                      year_marker = current_min
+                      lowest_uid_marker = current_min
+                      
+                      print(f"returned results: found: {count_found},  current_min: {current_min}, current_max: {current_max},  lowest_uid_marker: {lowest_uid_marker}, year: {year}  ")
+                      #if year_marker:
+                      print(f" Updated year_marker value: {year_marker}")
+
+
+                      
+                      # CRITICAL DETECTION: If it's exactly 1,000, Yahoo hit its response limit.
+                      # Loop again within the same year using our updated year_marker ceiling.
+                      #if count_found == 1000:
+                      #    print(f" -> Found 1,000 matches (Limit hit. Paging deeper into year {year}...)")
+                      #    time.sleep(0.3)  # Micro-break to keep connections stable
+                      #else:``
+                      #    print(f" -> Found {count_found:,} final matches for year {year}")
+                      #    year_complete = True
+                  else:
+                      #if year_marker == lowest_uid_marker:
+                      if currentYearCount == 0:
+                          print(f" -> No matches found in year {year}")
+                      doneWithYear = True
+
+                  if doneWithYear:
+                      year_complete = True
+                      print(f" -> Found {currentYearCount} final matches for year {year}")
+                      
+                      
+                  # Quick 0.5-second rest between operations to keep the connection rock stable
+                  time.sleep(0.5)
+                
+            except Exception as e:
+                print(f"Warning: Scan interrupted at year {year}. Error: {e}")
+                year_complete = True
+                break
+
+    total_messages = len(messages)
+    print(f"\nSearch complete. Total 'unsubscribe' emails found across all years: {total_messages:,}")
+    
+    if total_messages == 0:
+        print("No messages with unsubscribe found in Inbox.")
+        return
+        
+    # 3. Apply the user-defined safety cap limit if needed
+    if limit is not None and total_messages > limit:
+        messages = messages[:limit]
+        total_messages = len(messages)
+        print(f"Limiting movement execution to the first {limit:,} messages.")
+
+    # ==================== YOUR USER INTERACTIVE PROMPT ====================
+    print(f"\n⚠️ WARNING: You are about to move {total_messages:,} emails to the '{trash_folder}. You can review them there. " \
+            f"\nKeep in mind that the Trash may be automatically permanently deleted by your email provider periodically.' folder.")
+    user_confirmation = input("Are you sure you want to proceed? Type 'Yes' to continue: ")
+    
+    if user_confirmation.strip() != "Yes":
+        print("Operation cancelled by user. No emails were moved.")
+        return
+    # =======================================================================
+        
+    # 4. Chunked movement loop with the 1.5-second anti-ban pause
+    print(f"\nStarting chunked migration to {trash_folder}...")
+    for i in range(0, total_messages, CHUNK_SIZE):
+        chunk = messages[i:i + CHUNK_SIZE]
+        
+        # Atomically copy to Trash and mark original as deleted
+        server.move(chunk, trash_folder)
+        print(f"Moved batch starting at index {i:,} ({len(chunk)} emails) to {trash_folder}")
+        
+        # Critical safety pause to stay under Yahoo's command-frequency firewall thresholds
+        time.sleep(PAUSE_BETWEEN_CHUNKS)
+        
+    print(
+        f"\nEmails with 'unsubscribe' moved to {trash_folder}. "
+        "You can now review them there. You can move any you do not want to delete into another folder. "
+        "Then you can empty the Trash folder and lower your email storage!"
+    )
+    
+    # 5. Inline status check for the Trash folder count
+    try:
+        trash_status = server.folder_status(trash_folder, ["MESSAGES"])
+        trash_count = trash_status[b"MESSAGES"]
+        print(f"Current messages in {trash_folder}: {trash_count:,}")
+    except Exception:
+        print(f"Unable to determine message count for Trash folder '{trash_folder}'.")
+
+
+def move_unsubscribe_emails_to_trash1(server, inbox_candidates, trash_folder, limit=10000):
     # 1. Dynamically find and select the Inbox from candidates
     selected_folder = None
     for folder in inbox_candidates:
@@ -440,7 +761,7 @@ def  empty_trash_folder2(server, trash_folder):
 
         # 3. Loop through the Trash UIDs in safe chunks
         print(f"Beginning permanent purge (Chunk Size: {DELETE_CHUNK_SIZE})...")
-        for i in range(0, total_in_trash, CHUNK_SIZE):
+        for i in range(0, total_in_trash, DELETE_CHUNK_SIZE):
             chunk = trash_uids[i:i + DELETE_CHUNK_SIZE]
             
             # Step A: Add the system deletion flag to this specific batch
