@@ -1,14 +1,50 @@
 from http import server
 import os
+from pyexpat.errors import messages
 import sys
-import time
-import datetime
 import getpass
 import traceback
-import argparse
 from imapclient import IMAPClient
+import datetime
+import time
+import re
+import traceback
+import datetime
+import re
 
-# Account configuration for supported providers
+def is_valid_date(date_string: str, date_format: str) -> bool:
+    """
+    Validate that a date string matches a specified format and represents a valid date.
+    
+    Supported formats:
+        - "%d-%b-%Y" (e.g., "25-Dec-2023" or "01-Jan-2026")
+        - "%d-%m-%Y" (e.g., "25-12-2023")
+        - "%m-%d-%Y" (e.g., "12-25-2023")
+    """
+    # 1. Map python strptime formats to strict regex patterns
+    # [A-Z][a-z]{2} enforces title case for abbreviated months (Jan, Feb, etc.)
+    format_regex_map = {
+        "%d-%b-%Y": r"^\d{2}-[A-Z][a-z]{2}-\d{4}$",
+        "%d-%m-%Y": r"^\d{2}-\d{2}-\d{4}$",
+        "%m-%d-%Y": r"^\d{2}-\d{2}-\d{4}$",
+    }
+    
+    # Get the corresponding regex pattern, default to matching anything if not mapped
+    regex_pattern = format_regex_map.get(date_format, r"^.*$")
+    
+    # 2. Step 1: Structural validation (Regex check)
+    if not re.match(regex_pattern, date_string):
+        return False
+        
+    # 3. Step 2: Calendar validation (Logical date check)
+    try:
+        datetime.datetime.strptime(date_string, date_format)
+        return True
+    except ValueError:
+        return False
+
+
+
 ACCOUNT_CONFIG = {
   "yahoo.com": {
     "imap_server_read": "export.imap.mail.yahoo.com",
@@ -27,35 +63,28 @@ ACCOUNT_CONFIG = {
     "trash": "[Gmail]/Trash",
   },
 }
-
 server = None
 server_write = None
 
 # Safety Adjustments
-CHUNK_SIZE = 500
-PAUSE_BETWEEN_CHUNKS = 1.5
+CHUNK_SIZE = 500  # Number of emails moved per batch
+PAUSE_BETWEEN_CHUNKS = 1.5  # Seconds to rest between batches to prevent bans
 
 
-def is_valid_date(date_string: str, date_format: str) -> bool:
-  try:
-    datetime.datetime.strptime(date_string, date_format)
-    return True
-  except Exception:
-    return False
+def get_account_config(email):
+  for domain, config in ACCOUNT_CONFIG.items():
+    if domain in email:
+      return config
+  raise ValueError("Unsupported email domain. This script supports yahoo.com and gmail.com")
 
 
 def prompt_app_password():
   secret = os.environ.get("YAHOO_APP_PASSWORD")
   if secret:
     return secret
-  return getpass.getpass(prompt="Please enter the 16 character App Password for this account: ")
-
-
-def get_account_config(email):
-  domain = email.split("@")[-1].lower()
-  if domain in ACCOUNT_CONFIG:
-    return ACCOUNT_CONFIG[domain]
-  raise ValueError("Unsupported email domain. This script supports yahoo.com and gmail.com")
+  return getpass.getpass(
+    prompt="Please enter the 16 character App Password that you generated in your email provider for app emailtaxmenot: "
+  )
 
 
 def login_to_imap(email, imap_server, imap_port):
@@ -63,7 +92,7 @@ def login_to_imap(email, imap_server, imap_port):
   server = IMAPClient(imap_server, port=imap_port, use_uid=True, ssl=True)
   app_password = prompt_app_password()
   if not app_password:
-    raise RuntimeError("No app password provided")
+    raise ValueError("No app password provided via YAHOO_APP_PASSWORD or prompt.")
   server.login(email, app_password)
   return server
 
@@ -71,34 +100,48 @@ def login_to_imap(email, imap_server, imap_port):
 def select_inbox_folder(server, inbox_candidates):
   for candidate in inbox_candidates:
     try:
-      if server.folder_exists(candidate):
-        return candidate
+      server.select_folder(candidate)
+      return candidate
     except Exception:
       continue
-  raise RuntimeError(f"Unable to select the Inbox folder with any of: {', '.join(inbox_candidates)}")
+  raise RuntimeError(
+    f"Unable to select the Inbox folder with any of: {', '.join(inbox_candidates)}"
+  )
 
+
+# Safety Adjustments (Ensure these are defined globally in your script)
+CHUNK_SIZE = 500
+PAUSE_BETWEEN_CHUNKS = 1.5
 
 def get_folder_status(server, to_folder):
-  try:
-    status = server.folder_status(to_folder, ["MESSAGES"]) 
-    val = status.get(b"MESSAGES") or status.get("MESSAGES")
-    if val is None:
+  if not server.folder_exists(to_folder):
+      print(f"get_folder_status: Folder '{to_folder}' does not exist. Returning ...")
       return -1
-    return int(val)
-  except Exception:
-    return None
-
-
-def create_folder_if_not_exists(server, folder_name):
+          
+# Inline status check for the Trash folder count
   try:
-    if server.folder_exists(folder_name):
-      print(f"Folder '{folder_name}' already exists.")
-      return
-
-    server.create_folder(folder_name)
-    print(f"Folder '{folder_name}' created successfully.")
-  except Exception as e:
-    print(f"Error occurred while creating folder '{folder_name}': {e}")
+      to_folder_status = server.folder_status(to_folder, ["MESSAGES"])
+      to_folder_count = to_folder_status[b"MESSAGES"]
+        # Handle library variance for byte vs string key dictionary mapping
+      to_folder_count = to_folder_status.get(b"MESSAGES") or to_folder_status.get("MESSAGES", 0)
+      #if you select the folder you can also get count using - total_emails = folder_info['EXISTS'] 
+      print(f"get_folder_status: Current messages in {to_folder}: {to_folder_count:,}")
+      return to_folder_count  
+  
+  except Exception:
+      print(f"Unable to determine message count for  folder '{to_folder}'.")
+      return -1
+   
+def create_folder_if_not_exists(server, folder_name): 
+    try:
+        if server.folder_exists(folder_name):
+            print(f"Folder '{folder_name}' already exists.")
+            return
+        
+        server.create_folder(folder_name)
+        print(f"Folder '{folder_name}' created successfully.")
+    except Exception as e:
+        print(f"Error occurred while creating folder '{folder_name}': {e}")
 
 
 def move_messages_to_folder(server, messages, from_folder, to_folder, create_folder=True, chunk_size=CHUNK_SIZE, prompt_user=True, limit=None):
@@ -560,7 +603,7 @@ def get_folder_status_using_uid_pagination(server, folder_name, chunk_size=10000
   return total
 
 
-def get_folder_statuss(server, folder_name):
+def get_folder_status(server, folder_name):
   total = 0
   unread = 0
 
@@ -889,127 +932,116 @@ def main(argv=None):
 
         print("folder:", block["to_folder"], "criteria:", criteria)
 
-    action = known_args.action
-    email = known_args.email.lower()
+    if len(sys.argv) < 3:
+        print("Missing email address or action.")
+        print_usage()
+        sys.exit(1)
+
+    email = sys.argv[1].lower()
+    action = sys.argv[2].lower()
+
+
+    if action not in {"preview", "clean","trash", "empty", "purge","summary"}:
+        print(f"Unknown action: {action}")
+        print_usage()
+        sys.exit(1)
 
     try:
-      config = get_account_config(email)
+        config = get_account_config(email)
     except ValueError as error:
-      print(error)
-      sys.exit(1)
+        print(error)
+        sys.exit(1)
 
-    # Handle date flags and limits for clean/purge
-    date_filter = None
-    date_value = None
-    limit = known_args.limit if known_args.limit is not None else 0
-
+    limit = None
     if action in ["clean", "purge"]:
-      # require a limit argument (0 means unlimited is allowed)
-      if limit is None:
-        print("The clean or purge action requires a --limit argument (0 = unlimited).")
+        if len(sys.argv) < 6:
+            print("The clean or purge action requires a limit argument and a date before or since specification.")
+            print_usage() 
+            sys.exit(1)
+
+        try:
+            limit = int(sys.argv[3])
+            if limit <= 0:
+                limit = None  # Treat 0 or negative as unlimited
+
+        except ValueError:
+            print("Invalid limit. Limit must be a integer number. Use 0 for unlimited.")
+            print_usage()
+            sys.exit(1)
+        
+        date_filter = sys.argv[4].lower()
+
+        if date_filter not in {"before", "since"}:
+            print("Invalid date filter. Use 'before' or 'since'.")
+            print_usage()
+            sys.exit(1)
+
+        date_value = sys.argv[5]
+        if not is_valid_date(date_value, "%d-%b-%Y"):
+            print("Invalid date value. Use DD-MMM-YYYY format (eg 01-Jan-2020).")
+            print_usage()
+            sys.exit(1)
+
+        #collect optional keep criteria pairs from the command line arguments
+        keep_criteria = [] 
+        for i in range(6, len(sys.argv), 2):
+            if i + 1 >= len(sys.argv):
+                print("Keep folder and criteria pairs are incomplete.")
+                print_usage()
+                sys.exit(1)
+            keep_folder = sys.argv[i]
+            keep_criteria_value = sys.argv[i + 1]
+            keep_criteria.append((keep_folder, keep_criteria_value))  
+
+
+        
+    elif len(sys.argv) >= 4:
+        print("The preview, summary and empty actions do not accept a limit argument or any other criteria.")
         print_usage()
         sys.exit(1)
-
-      if known_args.since and known_args.before:
-        print("Please specify only one of --since or --before.")
-        print_usage()
-        sys.exit(1)
-
-      if not known_args.since and not known_args.before:
-        print("The clean or purge action requires a date filter: --since or --before.")
-        print_usage()
-        sys.exit(1)
-
-      if known_args.since:
-        date_filter = "since"
-        date_value = known_args.since
-      else:
-        date_filter = "before"
-        date_value = known_args.before
-
-      if not is_valid_date(date_value, "%d-%b-%Y"):
-        print("Invalid date value. Use DD-MMM-YYYY format (eg 01-Jan-2020).")
-        print_usage()
-        sys.exit(1)
-    else:
-      # preview, summary, empty and trash should not receive date flags
-      if known_args.since or known_args.before or known_args.limit:
-        if action in {"preview", "summary", "empty"} and (known_args.since or known_args.before or (known_args.limit and known_args.limit != 0)):
-          print("The preview, summary and empty actions do not accept a limit or date arguments.")
-          print_usage()
-          sys.exit(1)
 
     try:
-      server = login_to_imap(email, config["imap_server_read"], config["imap_port_read"])
-
-      if action == "preview":
-        preview_unsubscribe_emails_with_trash(server, config["inbox"], config["trash"])
-
-      elif action == "trash":
-        while True:
-          total_moved = move_all_folder_messages(server, "Pre Trash", config["trash"]) 
-          if total_moved == 0:
-            break
-
-      elif action == "clean":
-        remaining_limit = None if limit == 0 else limit
-        while True:
-          moved_count = move_unsubscribe_emails_to_trash2(
-            server,
-            config["inbox"],
-            "Pre Trash",
-            remaining_limit,
-            date_filter,
-            date_value,
-            keep_criteria,
-          )
-          if moved_count == 0:
-            break
-          if limit is not None and limit != 0:
-            break
-
-      elif action == "summary":
-        summarize_folders(server)
-
-      elif action == "purge":
-        # purge = clean, then trash, then empty
-        remaining_limit = None if limit == 0 else limit
-        while True:
-          moved_count = move_unsubscribe_emails_to_trash2(
-            server,
-            config["inbox"],
-            "Pre Trash",
-            remaining_limit,
-            date_filter,
-            date_value,
-            keep_criteria,
-          )
-          if moved_count == 0:
-            break
-          if limit is not None and limit != 0:
-            break
-
-        while True:
-          total_moved = move_all_folder_messages(server, "Pre Trash", config["trash"]) 
-          if total_moved == 0:
-            break
-
-        while True:
-          total_deleted = empty_trash_folder2(server, config["trash"]) 
-          if total_deleted == 0:
-            break
-
-      else:  # empty
-        while True:
-          total_deleted = empty_trash_folder2(server, config["trash"]) 
-          if total_deleted == 0:
-            break
+        server =  login_to_imap(email, config["imap_server_read"], config["imap_port_read"])
+        #server_write = server
+        #server_write = login_to_imap(email, config["imap_server_write"], config["imap_port_write"])
+        if action == "preview":
+            preview_unsubscribe_emails_with_trash(server, config["inbox"], config["trash"])
+        elif action == "trash":
+            while True:
+                total_moved = move_all_folder_messages(server, "Pre Trash", config["trash"])
+                if total_moved == 0:
+                break
+        elif action == "clean":
+            remaining_limit = limit
+            while True:
+                moved_count = move_unsubscribe_emails_to_trash2(
+                server,
+                config["inbox"],
+                "Pre Trash",
+                remaining_limit,
+                date_filter,
+                date_value,
+                keep_criteria
+                )
+                if moved_count == 0:
+                    break
+                if limit is not None:
+                    remaining_limit -= moved_count
+                if remaining_limit <= 0:
+                    break
+        elif action == "summary":
+            summarize_folders(server)
+        else:
+            while True:
+                total_deleted = empty_trash_folder2(server, config["trash"])
+                if total_deleted == 0:
+                    break
 
     except Exception as error:
-      print(f"\nUhoh! An exception occurred: {error}")
-      traceback.print_exc()
-      sys.exit(1)
+        print(f"\nUhoh! An exception occurred: {error}")
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-  main()
+    main()
