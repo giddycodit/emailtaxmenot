@@ -1,0 +1,125 @@
+Conversation Summary
+====================
+
+Overview:
+- You are evolving `emailtaxmenot.py` from a Yahoo unsubscribe cleanup script toward a more general email taming tool.
+- The current flow uses `Pre Trash` as a staging folder and `keep` rules to preserve messages before final deletion.
+- We identified a bug where `move_all_folder_messages()` passed the wrong variable (`messages` instead of `all_uids`) into `move_messages_to_folder()`.
+
+Key design decisions:
+- Keep the user-facing CLI focused and safe.
+- Use explicit actions rather than exposing a full generic move action too early.
+- Implement `deletejunk` for hard-coded unsubscribe cleanup.
+- Implement `clean` for user-defined search criteria via `--search` blocks.
+- Keep `keep` for repeated `--keep` groups that move messages from `Pre Trash` into specified folders.
+
+Recommended CLI behavior:
+- `--action deletejunk`:
+  - hard-coded unsubscribe search.
+  - moves matching Inbox messages into `Pre Trash`.
+- `--action clean`:
+  - uses custom `--search` criteria.
+  - moves matching Inbox messages into `Pre Trash`.
+- `--action keep`:
+  - uses repeated `--keep` groups.
+  - moves matching messages from `Pre Trash` into the specified folders.
+- `--action trash`, `--action empty`, `--action purge`, `--action summary` remain as safety and reporting actions.
+
+Search criteria format:
+- Use the same style as `--keep`, but with `--search` instead of `--keep`.
+- Example:
+  python emailtaxmenot.py --action clean --email you@example.com \
+    --search --from sender@example.com --subject "newsletter" --body "unsubscribe"
+- The criteria should be combined into a flat IMAP search list:
+  ["FROM", value, "TO", value, "SUBJECT", value, "BODY", value]
+- This effectively ANDs the fields in IMAP search.
+
+Suggested code changes:
+
+1. Update `build_parser()`:
+- Set action choices to:
+  ["deletejunk", "clean", "keep", "trash", "empty", "purge", "summary"]
+- Keep existing options:
+  `--email`, `--dry-run`, `--limit`, `--since`, `--before`
+
+2. Add `parse_search_groups(tokens)` helper:
+```python
+def parse_search_groups(tokens):
+    groups = []
+    current = None
+    i = 0
+
+    while i < len(tokens):
+        token = tokens[i]
+
+        if token == "--search":
+            if current is not None:
+                groups.append(current)
+            current = {"criteria": {}}
+            i += 1
+            continue
+
+        if current is None:
+            raise ValueError("Expected --search before search-group options")
+
+        if token in ("--from", "--to", "--subject", "--body"):
+            key = token.lstrip("-")
+            current["criteria"][key] = tokens[i + 1]
+            i += 2
+            continue
+
+        raise ValueError(f"Unknown token: {token}")
+
+    if current is not None:
+        groups.append(current)
+
+    return groups
+```
+
+3. Add a shared IMAP criteria builder:
+```python
+def build_imap_criteria(criteria):
+    search = []
+    if criteria.get("from"):
+        search += ["FROM", criteria["from"]]
+    if criteria.get("to"):
+        search += ["TO", criteria["to"]]
+    if criteria.get("subject"):
+        search += ["SUBJECT", criteria["subject"]]
+    if criteria.get("body"):
+        search += ["BODY", criteria["body"]]
+    return search
+```
+
+4. Update `main()` parsing logic:
+- Parse keep blocks and search blocks from the remaining args:
+  `keep_blocks = parse_keep_groups(remaining)`
+  `search_blocks = parse_search_groups(remaining)`
+- Use `keep_blocks` for `keep` action.
+- Use `search_blocks` for `clean` action.
+
+5. Update action semantics in `main()`:
+- `deletejunk` should call the cleanup routine with `search_criteria=["BODY", "unsubscribe"]`.
+- `clean` should require a `--search` block and build `search_criteria` from it.
+- Keep `trash`, `empty`, `purge`, `summary` as existing flows.
+
+6. Refresh `print_usage()` text:
+- Replace old positional usage docs with modern options-based help.
+- Document `--search` and `--keep` group syntax.
+- Remove outdated `preview` references if you stop using it.
+- Add examples for `deletejunk`, `clean`, `keep`, `summary`.
+
+Recommendation on generic move action:
+- Keep the generic internal helper now, but postpone exposing a broad `move` action in the CLI.
+- A simpler product launch is safer and easier to explain.
+- If you later add it, do so as a clearly separated action like `--action move --from-folder ... --to-folder ...`.
+
+Launch advice:
+- Focus on a minimal, opinionated CLI first.
+- Support user-defined clean searches and explicit keep rules.
+- Preserve the `Pre Trash` staging workflow as the safe default.
+- Add generic move later once the core cleanup flow is stable.
+
+Notes:
+- The codespace files remain while the codespace exists.
+- This summary can be saved in the workspace for later reference.

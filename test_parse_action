@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+
+python emailtaxmenot.py --dry-run  --action keep --email youremail@yahoo.com \
+  --keep --to_folder Friends --from friend@example.com
+
+python emailtaxmenot.py --dry-run --action keep --email youremail@yahoo.com \
+--keep --to_folder Friends --from friend@example.com --subject "Weekly Update" \
+--keep --to_folder Work --to workgroup@example.com
+
+python emailtaxmenot.py --dry-run --action keep --email youremail@yahoo.com \
+--keep --to_folder Equestrian --body equestrian
+
+python emailtaxmenot.py --dry-run --action keep --email youremail@yahoo.com \
+--keep --to_folder Equestrian --body horse
+
+python emailtaxmenot.py --dry-run --action clean --email youremail@yahoo.com \
+--limit 1000 --before 01-Jan-2020 \
+--keep --to_folder Friends --from friend@example.com \
+--keep --to_folder Work --subject "Project"
+
+python emailtaxmenot.py --dry-run --action clean --email youremail@yahoo.com \
+--limit 500 --since 01-Jan-2024 \
+--keep --to_folder Important --to boss@example.com
+
+python emailtaxmenot.py --dry-run --action purge --email youremail@yahoo.com \
+--limit 1000 --before 01-Jan-2020 \
+--keep --to_folder Friends --from friend@example.com \
+--keep --to_folder Personal --subject "Family"

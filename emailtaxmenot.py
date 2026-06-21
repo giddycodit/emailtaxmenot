@@ -1,14 +1,52 @@
+import argparse
 from http import server
 import os
+from pyexpat.errors import messages
 import sys
-import time
-import datetime
 import getpass
 import traceback
-import argparse
 from imapclient import IMAPClient
+import datetime
+import time
+import re
+import traceback
+import datetime
+import re
 
-# Account configuration for supported providers
+
+def is_valid_date(date_string: str, date_format: str) -> bool:
+    """
+    Validate that a date string matches a specified format and represents a valid date.
+
+    Supported formats:
+        - "%d-%b-%Y" (e.g., "25-Dec-2023" or "01-Jan-2026")
+        - "%d-%m-%Y" (e.g., "25-12-2023")
+        - "%m-%d-%Y" (e.g., "12-25-2023")
+    """
+    # 1. Map python strptime formats to strict regex patterns
+    # [A-Z][a-z]{2} enforces title case for abbreviated months (Jan, Feb, etc.)
+    format_regex_map = {
+        "%d-%b-%Y": r"^\d{2}-[A-Z][a-z]{2}-\d{4}$",
+        "%d-%m-%Y": r"^\d{2}-\d{2}-\d{4}$",
+        "%m-%d-%Y": r"^\d{2}-\d{2}-\d{4}$",
+    }
+
+    # Get the corresponding regex pattern, default to matching anything if not
+    # mapped
+    regex_pattern = format_regex_map.get(date_format, r"^.*$")
+
+    # 2. Step 1: Structural validation (Regex check)
+    if not re.match(regex_pattern, date_string):
+        return False
+
+    # 3. Step 2: Calendar validation (Logical date check)
+    try:
+        datetime.datetime.strptime(date_string, date_format)
+        return True
+    except ValueError:
+        return False
+
+
 ACCOUNT_CONFIG = {
   "yahoo.com": {
     "imap_server_read": "export.imap.mail.yahoo.com",
@@ -27,35 +65,29 @@ ACCOUNT_CONFIG = {
     "trash": "[Gmail]/Trash",
   },
 }
-
 server = None
 server_write = None
 
 # Safety Adjustments
-CHUNK_SIZE = 500
-PAUSE_BETWEEN_CHUNKS = 1.5
+CHUNK_SIZE = 500  # Number of emails moved per batch
+PAUSE_BETWEEN_CHUNKS = 1.5  # Seconds to rest between batches to prevent bans
 
 
-def is_valid_date(date_string: str, date_format: str) -> bool:
-  try:
-    datetime.datetime.strptime(date_string, date_format)
-    return True
-  except Exception:
-    return False
+def get_account_config(email):
+  for domain, config in ACCOUNT_CONFIG.items():
+    if domain in email:
+      return config
+  raise ValueError(
+      "Unsupported email domain. This script supports yahoo.com and gmail.com")
 
 
 def prompt_app_password():
   secret = os.environ.get("YAHOO_APP_PASSWORD")
   if secret:
     return secret
-  return getpass.getpass(prompt="Please enter the 16 character App Password for this account: ")
-
-
-def get_account_config(email):
-  domain = email.split("@")[-1].lower()
-  if domain in ACCOUNT_CONFIG:
-    return ACCOUNT_CONFIG[domain]
-  raise ValueError("Unsupported email domain. This script supports yahoo.com and gmail.com")
+  return getpass.getpass(
+    prompt="Please enter the 16 character App Password that you generated in your email provider for app emailtaxmenot: "
+  )
 
 
 def login_to_imap(email, imap_server, imap_port):
@@ -63,7 +95,8 @@ def login_to_imap(email, imap_server, imap_port):
   server = IMAPClient(imap_server, port=imap_port, use_uid=True, ssl=True)
   app_password = prompt_app_password()
   if not app_password:
-    raise RuntimeError("No app password provided")
+    raise ValueError(
+        "No app password provided via YAHOO_APP_PASSWORD or prompt.")
   server.login(email, app_password)
   return server
 
@@ -71,45 +104,75 @@ def login_to_imap(email, imap_server, imap_port):
 def select_inbox_folder(server, inbox_candidates):
   for candidate in inbox_candidates:
     try:
-      if server.folder_exists(candidate):
-        return candidate
+      server.select_folder(candidate)
+      return candidate
     except Exception:
       continue
-  raise RuntimeError(f"Unable to select the Inbox folder with any of: {', '.join(inbox_candidates)}")
+  raise RuntimeError(
+    f"Unable to select the Inbox folder with any of: {
+    ', '.join(inbox_candidates)}"
+  )
+
+
+# Safety Adjustments (Ensure these are defined globally in your script)
+CHUNK_SIZE = 500
+PAUSE_BETWEEN_CHUNKS = 1.5
 
 
 def get_folder_status(server, to_folder):
-  try:
-    status = server.folder_status(to_folder, ["MESSAGES"]) 
-    val = status.get(b"MESSAGES") or status.get("MESSAGES")
-    if val is None:
+  if not server.folder_exists(to_folder):
+      print(
+    f"get_folder_status: Folder '{to_folder}' does not exist. Returning ...")
       return -1
-    return int(val)
+
+# Inline status check for the Trash folder count
+  try:
+      to_folder_status = server.folder_status(to_folder, ["MESSAGES"])
+      to_folder_count = to_folder_status[b"MESSAGES"]
+        # Handle library variance for byte vs string key dictionary mapping
+      to_folder_count = to_folder_status.get(
+          b"MESSAGES") or to_folder_status.get("MESSAGES", 0)
+      # if you select the folder you can also get count using - total_emails =
+      # folder_info['EXISTS']
+      print(
+    f"get_folder_status: Current messages in {to_folder}: {
+        to_folder_count:,}")
+      return to_folder_count
+
   except Exception:
-    return None
+      print(f"Unable to determine message count for  folder '{to_folder}'.")
+      return -1
 
 
 def create_folder_if_not_exists(server, folder_name):
-  try:
-    if server.folder_exists(folder_name):
-      print(f"Folder '{folder_name}' already exists.")
-      return
+    try:
+        if server.folder_exists(folder_name):
+            print(f"Folder '{folder_name}' already exists.")
+            return
 
-    server.create_folder(folder_name)
-    print(f"Folder '{folder_name}' created successfully.")
-  except Exception as e:
-    print(f"Error occurred while creating folder '{folder_name}': {e}")
+        server.create_folder(folder_name)
+        print(f"Folder '{folder_name}' created successfully.")
+    except Exception as e:
+        print(f"Error occurred while creating folder '{folder_name}': {e}")
 
 
-def move_messages_to_folder(server, messages, from_folder, to_folder, create_folder=True, chunk_size=CHUNK_SIZE, prompt_user=True, limit=None):
-  
+def move_messages_to_folder(
+    server,
+    messages,
+    from_folder,
+    to_folder,
+    create_folder=True,
+    chunk_size=CHUNK_SIZE,
+    prompt_user=True,
+     limit=None):
+
   print(f"\nmove_messages_to_folder: {from_folder} -> {to_folder}.")
-  
+
   if create_folder:
     create_folder_if_not_exists(server, to_folder)
 
   total_messages = len(messages)
-  
+
   # Convert to a set to remove duplicates, then back to a sorted list
   unique_messages = sorted(list(set(messages)))
 
@@ -122,60 +185,89 @@ def move_messages_to_folder(server, messages, from_folder, to_folder, create_fol
   if total_messages == 0:
       print("No messages to move. Returning")
       return
-      
+
   # 3. Apply the user-defined safety cap limit if needed
   if limit is not None and total_messages > limit:
       messages = messages[:limit]
       total_messages = len(messages)
       print(f"Limiting movement execution to the first {limit:,} messages.")
 
-
   # ==================== YOUR USER INTERACTIVE PROMPT ====================
   if prompt_user:
-    print(f"\n⚠️ WARNING: You are about to move {total_messages:,} emails to the folder'{to_folder}. You can review them there. " )
-    user_confirmation = input("Are you sure you want to proceed? Type 'Yes' to continue: ")
-    
+    print(
+    f"\n⚠️ WARNING: You are about to move {
+        total_messages:,        } emails to the folder'{to_folder}. You can review them there. ")
+    user_confirmation = input(
+        "Are you sure you want to proceed? Type 'Yes' to continue: ")
+
     if user_confirmation.strip() != "Yes":
         print("Operation cancelled by user. No emails were moved.")
         return
   # =======================================================================
   to_folder_count = get_folder_status(server, to_folder)
+  total_moved = 0
 
   # 4. Chunked movement loop with the 1.5-second anti-ban pause
   print(f"\nStarting chunked migration to {to_folder}...")
   for i in range(0, total_messages, chunk_size):
       chunk = messages[i:i + chunk_size]
-      
+
       # Atomically copy to Trash and mark original as deleted
       server.move(chunk, to_folder)
-      print(f"Moved batch starting at index {i:,} ({len(chunk)} emails) to {to_folder}")
-      
-      # Critical safety pause to stay under Yahoo's command-frequency firewall thresholds
+      print(
+    f"Moved batch starting at index {
+        i:,} ({
+            len(chunk)} emails) to {to_folder}")
+      total_moved += len(chunk)
+      print("move_messages_to_folder: Running server.noop() after moving a chunk of messages ...")
+      server.noop()
+
+      # Critical safety pause to stay under Yahoo's command-frequency firewall
+      # thresholds
       time.sleep(PAUSE_BETWEEN_CHUNKS)
-      
+
   print(
-      f"\nEmails moved to folder {to_folder}. "
-      "You can now review them there.  "     
+      f"\n{total_moved} Emails moved to folder {to_folder}. "
+      "You can now review them there.  "
   )
-  
-  #server_write.noop()  # Refresh server state after moving messages
-  server.noop()  # Refresh server state after moving messages
+
 
   # 5. Inline status check for the Trash folder count
   try:
       to_folder_count = get_folder_status(server, to_folder)
       if to_folder_count < total_messages:
         print("ℹ️ Note: Yahoo server-side indexing can lag causing the count to be inaccurate.")
-        print("The emails are safe; log into mail.yahoo.com to see the fully updated tally.")
+        print(
+            "The emails are safe; log into mail.yahoo.com to see the fully updated tally.")
 
   except Exception:
       print(f"Unable to determine message count for  folder '{to_folder}'.")
 
+  return total_moved
 
+def move_specified_messages(server, from_folder, keep_criteria):
+    total_messages_moved = 0
+    for criteria in keep_criteria:
+      messages_moved = 0
+      messages_moved = move_all_folder_messages(server,
+                                "Pre Trash",
+                                criteria["to_folder"],
+                                500,
+                                criteria["search_criteria"]
+                                )
+      total_messages_moved += messages_moved
+    return total_messages_moved
 
-def move_all_folder_messages(server, from_folder, to_folder, chunk_size=500, user_search_criteria=None):
+     
+
+def move_all_folder_messages(
+    server,
+    from_folder,
+    to_folder,
+    chunk_size=500,
+    search_criteria=['All']):
     """
-    Fetches all UIDs once to prevent Yahoo index fragmentation bugs, 
+    Fetches all UIDs once to prevent Yahoo index fragmentation bugs,
     then moves them in cautious batches with error retries.
     """
     # 1. Select the source folder
@@ -183,7 +275,7 @@ def move_all_folder_messages(server, from_folder, to_folder, chunk_size=500, use
 
         print(f"Opened '{from_folder}'. ")
         total_messages = get_folder_status(server, from_folder)
-        print(f"Total messages in '{from_folder}': {total_messages}")   
+        print(f"Total messages in '{from_folder}': {total_messages}")
         if total_messages == 0:
             print("Folder is empty.")
             return
@@ -193,21 +285,9 @@ def move_all_folder_messages(server, from_folder, to_folder, chunk_size=500, use
         print(f"Error selecting source folder '{from_folder}': {e}")
         return
 
-    search_criteria=[]
-    if user_search_criteria is None:
-      search_criteria=['ALL']
-    else:
-      search_criteria_pairs = user_search_criteria.split('|')
-      for uc in search_criteria_pairs:
-        ucp = uc.split(':',1)
-        ucp[0] = ucp[0].upper()
-        search_criteria.extend(ucp)
-
-    
-
-
     # 2. Fetch ALL static UIDs right now so we don't rely on shifting indexes
-    print(f"move_all_folder_messages: Search for messages to move from '{from_folder}' to '{to_folder}' using search_criteria: {search_criteria}")
+    print(
+    f"move_all_folder_messages: Search for messages to move from '{from_folder}' to '{to_folder}' using search_criteria: {search_criteria}")
     all_uids = server.search(search_criteria)
     total_emails = len(all_uids)
     print(f"Found {total_emails} messages to move.")
@@ -216,77 +296,98 @@ def move_all_folder_messages(server, from_folder, to_folder, chunk_size=500, use
         print("Folder is empty. Returning ...")
         return 0
 
-    total_moved = 0
+    return move_messages_to_folder(server,
+                                  all_uids,
+                                  "Pre Trash",
+                                  to_folder,
+                                  True,
+                                  500,
+                                  False)
+
 
     # 3. Slice the stable Python list of UIDs into blocks
     for i in range(0, total_emails, chunk_size):
-        chunk = all_uids[i : i + chunk_size]
-        
+        chunk = all_uids[i: i + chunk_size]
+
         # Retry loop specifically designed to beat Yahoo's [SERVERBUG]
         retries = 3
         while retries > 0:
             try:
-                print(f"Moving chunk {i//chunk_size + 1} ({len(chunk)} emails)...")
-                
+                print(f"Moving chunk {i // chunk_size + 1} ({ len(chunk)} emails)...")
+
                 # Move this explicit batch of permanent IDs
                 server.move(chunk, to_folder)
-                
+
                 total_moved += len(chunk)
+
+                # CRITICAL: Cooldown gives Yahoo's database time to re-index
+                # rows
+                time.sleep(1.5)
                 
-                # CRITICAL: Cooldown gives Yahoo's database time to re-index rows
-                time.sleep(1.5) 
-                break # Success, exit retry loop
-                
+                print("move_all_folder_messages: Running server.noop() after moving a chunk of messages ...")
+                server.noop()
+                break  # Success, exit retry loop
+
             except Exception as e:
                 retries -= 1
                 error_str = str(e)
                 print(f" -> Yahoo Server Hitch: {error_str}")
-                
+
                 if "SERVERBUG" in error_str or "try again later" in error_str:
-                    print(f" -> Pausing 5 seconds to let Yahoo recover. Retries left: {retries}")
+                    print(
+    f" -> Pausing 5 seconds to let Yahoo recover. Retries left: {retries}")
                     time.sleep(5)
                 else:
                     print(" -> Non-recoverable error. Stopping.")
                     return
 
         if retries == 0:
-            print("\n[Fatal] Yahoo refused to clear this chunk after multiple retries. Stopping.")
+            print(
+                "\n[Fatal] Yahoo refused to clear this chunk after multiple retries. Stopping.")
             return
 
-    print(f"\nProcessing complete! Successfully migrated {total_moved} emails to '{to_folder}'.")
+    print(
+    f"\nProcessing complete! Successfully migrated {total_moved} emails to '{to_folder}'.")
     return total_moved
 
 
-def move_unsubscribe_emails_to_trash2(server, inbox_candidates, trash_folder, limit=None, date_filter="SINCE", date_filter_value="01-Jan-1997", keep_criteria=[] ):
+def move_unsubscribe_emails_to_trash2(
+    server,
+    inbox_candidates,
+    trash_folder,
+    limit=None,
+    date_filter="SINCE",
+    date_filter_value="01-Jan-1997",
+     keep_criteria=[]):
     # 1. Dynamically find and select the Inbox from candidates
     selected_folder = None
     for folder in inbox_candidates:
         if server.folder_exists(folder):
             selected_folder = folder
             break
-            
+
     if not selected_folder:
         print("Error: Could not find a valid Inbox folder from candidates.")
         return 0
 
     # Select the inbox in read/write mode so we can move items out of it
-    print(f"running initial server.select_folder({selected_folder}, readonly=false) ...")
+    print(
+    f"running initial server.select_folder({selected_folder}, readonly=false) ...")
     server.select_folder(selected_folder, readonly=False)
     print(f"Selected folder: {selected_folder}")
-    
+
     # 2. Execute a universal, year-by-year search with intra-year pagination
     print("Executing historical index search for 'unsubscribe'...")
     messages = []
     total_messages = 0
 
+    FIRST_POSSIBLE_YEAR = 1997
 
-    FIRST_POSSIBLE_YEAR = 1997 
-    
-    # Track the absolute lowest UID found across the entire run to use as an upper boundary
+    # Track the absolute lowest UID found across the entire run to use as an
+    # upper boundary
     lowest_uid_marker = None
     year_marker = None
     currentYearCount = 0
-  
 
     date_filter = date_filter.upper()
     year_increment = -1
@@ -298,96 +399,112 @@ def move_unsubscribe_emails_to_trash2(server, inbox_candidates, trash_folder, li
        current_year = datetime.datetime.now().year
        from_year = current_year
        to_year = int(date_filter_value[-4:])
-       #preserve to_year in range
-       to_year = to_year -1
+       # preserve to_year in range
+       to_year = to_year - 1
     elif date_filter == "BEFORE":
-      # we will go from the earliest possible year to the specified before date, one year at a time
+      # we will go from the earliest possible year to the specified before
+      # date, one year at a time
        to_year = FIRST_POSSIBLE_YEAR
        from_year = int(date_filter_value[-4:])
-       #preserve to_year in range
+       # preserve to_year in range
        to_year = to_year + 1
-       #year_increment = 1
+       # year_increment = 1
     else:
-        raise ValueError("Invalid date_filter. Please use 'SINCE' or 'BEFORE'.")
+        raise ValueError(
+            "Invalid date_filter. Please use 'SINCE' or 'BEFORE'.")
 
-    
     # for since date criteria Loops backward from the current year to the specified since year
     # for before date criteria, loops backward from the specified before year to the first possible year
     # this preserves the most recent emails in the search results
     # being found first
 
-    print(f"Search terms from_year: {from_year}, to_year: {to_year}, year_increment: {year_increment} ." )
+    print(
+    f"Search terms from_year: {from_year}, to_year: {to_year}, year_increment: {year_increment} .")
     for year in range(from_year, to_year, year_increment):
-    #for year in [FIRST_POSSIBLE_YEAR]:
+    # for year in [FIRST_POSSIBLE_YEAR]:
         print(f"Scanning year {year} for matching emails...")
-        
-        # Internal control flags to paginate years containing more than 1,000 matches
+
+        # Internal control flags to paginate years containing more than 1,000
+        # matches
         year_complete = False
-        #year_marker = None #lowest_uid_marker
+        # year_marker = None #lowest_uid_marker
         currentYearCount = 0
         year_marker = None
         last_current_max = None
-        
+
         while not year_complete:
-          
+
           year_filter_date = f"01-Jan-{year}"
 
           if int(date_filter_value[-4:]) == year:
-            #if we are in the year of the specified date value, we need to set to the actual provided date_filter_value
+            # if we are in the year of the specified date value, we need to set
+            # to the actual provided date_filter_value
             year_filter_date = date_filter_value
-            
-            
+
           try:
               doneWithYear = False
               while not doneWithYear:
-                search_criteria = ['BODY', '"unsubscribe"',date_filter, year_filter_date  ]
+                search_criteria = [
+    'BODY',
+    '"unsubscribe"',
+    date_filter,
+     year_filter_date]
                 if date_filter == "BEFORE":
-                    search_criteria = ['BODY', '"unsubscribe"',date_filter, year_filter_date, "SINCE", f"01-Jan-{year - 1}"] 
-                # Only inject the ceiling restriction if we have a valid, active marker
+                    search_criteria = ['BODY',
+    '"unsubscribe"',
+    date_filter,
+    year_filter_date,
+    "SINCE",
+     f"01-Jan-{year - 1}"]
+                # Only inject the ceiling restriction if we have a valid,
+                # active marker
                 if year_marker is not None:
                     # Instead, define sliding chunk boundaries dynamically inside your loop loop:
-                    #search_low = year_marker - 5000
-                    uid_search_range = f"1:{year_marker-1}"
-                    #uid_search_range = f"{current_max + 1}:{current_max+500}"
+                    # search_low = year_marker - 5000
+                    uid_search_range = f"1:{year_marker - 1}"
+                    # uid_search_range = f"{current_max + 1}:{current_max+500}"
                     last_current_max = current_max
-                    #print(f"Scanning UID range: {uid_search_range}")
-                    #search_criteria.extend(['UID', uid_search_range])
-                    #search_criteria = f"['UID', '{uid_search_range}']"  
-
-                
+                    # print(f"Scanning UID range: {uid_search_range}")
+                    # search_criteria.extend(['UID', uid_search_range])
+                    # search_criteria = f"['UID', '{uid_search_range}']"
 
                 print(f"Searching with criteria: {search_criteria} ")
 
-                  #yearly_matches = server.search(search_criteria)        
-                # This forces Yahoo to scan only one narrow window block at a time
+                  # yearly_matches = server.search(search_criteria)
+                # This forces Yahoo to scan only one narrow window block at a
+                # time
                 yearly_matches = server.search(search_criteria)
-                
-                if isinstance(yearly_matches, list) and yearly_matches and len(yearly_matches) > 0:
+
+                if isinstance(
+    yearly_matches,
+     list) and yearly_matches and len(yearly_matches) > 0:
                     messages.extend(yearly_matches)
                     count_found = len(yearly_matches)
                     currentYearCount += count_found
 
-                    # Update local tracking variables with the smallest tracking pointer found
+                    # Update local tracking variables with the smallest
+                    # tracking pointer found
                     current_min = min(yearly_matches)
                     current_max = max(yearly_matches)
                     if year_increment == -1:
                           year_marker = current_min
                     else:
                         year_marker = current_max
-                        
 
                     lowest_uid_marker = current_min
-                    
-                    print(f"returned results: found: {count_found},  current_min: {current_min}, current_max: {current_max},  lowest_uid_marker: {lowest_uid_marker}, since year: {year}  ")
-                    #if year_marker:
+
+                    print(
+    f"returned results: found: {count_found},  current_min: {current_min}, current_max: {current_max},  lowest_uid_marker: {lowest_uid_marker}, since year: {year}  ")
+                    # if year_marker:
                     print(f" Updated year_marker value: {year_marker}")
 
                     if last_current_max == current_max:
-                        print(f"Warning: UID pagination appears to be stuck at {current_max}. Ending year scan to prevent infinite loop.")
+                        print(
+    f"Warning: UID pagination appears to be stuck at {current_max}. Ending year scan to prevent infinite loop.")
                         doneWithYear = True
 
                 else:
-                    #if year_marker == lowest_uid_marker:
+                    # if year_marker == lowest_uid_marker:
                     if currentYearCount == 0:
                         print(f" -> No matches found in year {year}")
                     doneWithYear = True
@@ -395,15 +512,15 @@ def move_unsubscribe_emails_to_trash2(server, inbox_candidates, trash_folder, li
                 if doneWithYear:
                     year_complete = True
                     print(f" -> Found {currentYearCount} final matches for year {year}")
-                    
-                    
-                # Quick 0.5-second rest between operations to keep the connection rock stable
+
+                # Quick 0.5-second rest between operations to keep the
+                # connection rock stable
                 time.sleep(0.5)
                 num_messages = len(messages)
                 move_limit = None
                 if limit is not None:
                   remaining_limit = limit - total_messages
-                  print(f"remaining_limit is {remaining_limit} of limit {liit}")
+                  print(f"remaining_limit is {remaining_limit} of limit {limit}")
 
                   if num_messages > remaining_limit:
                       move_limit = remaining_limit
@@ -412,23 +529,33 @@ def move_unsubscribe_emails_to_trash2(server, inbox_candidates, trash_folder, li
                     total_messages += num_messages
                 else:
                   total_messages += num_messages
-                  
 
                 if num_messages > 0:
-                  move_messages_to_folder(server, messages, "Inbox", "Pre Trash", True, CHUNK_SIZE, False , move_limit)
+                  move_messages_to_folder(
+    server,
+    messages,
+    "Inbox",
+    "Pre Trash",
+    True,
+    CHUNK_SIZE,
+    False,
+     move_limit)
                   # Close out the current folder view session to kill stale server memory pointers
-                  #print("running server.close_folder()...")
-                  #server.close_folder()
+                  # print("running server.close_folder()...")
+                  # server.close_folder()
                   print("running server.noop()...")
                   server.noop()
-                  #print("running server.select_folder(selected_folder, readonly=False)...")
-                  #server.select_folder(selected_folder, readonly=False)
+                  # print("running server.select_folder(selected_folder, readonly=False)...")
+                  # server.select_folder(selected_folder, readonly=False)
+
+                  #now apply the keep criteria to the chunk that was just
+                  move_specified_messages(server, "Pre Trash", keep_criteria)
+                  
                 messages = []
                 if move_limit is not None:
-                    print(f"Reached user-defined limit of {limit} messages. Stopping search.")
+                    print(
+    f"Reached user-defined limit of {limit} messages. Stopping search.")
                     return total_messages
-                
-
 
           except Exception as e:
               print(f"Warning: Scan interrupted at year {year}. Error: {e}")
@@ -444,16 +571,18 @@ def move_unsubscribe_emails_to_trash2(server, inbox_candidates, trash_folder, li
                   f"line {tb.tb_lineno}"
               )
 
-              traceback.print_exc() 
+              traceback.print_exc()
               year_complete = True
               break
 
-    
-    print(f"\nSearch complete. Total 'unsubscribe' emails found across all years: {total_messages:,}")
-    
+    print(
+    f"\nSearch complete. Total 'unsubscribe' emails found across all years: {
+        total_messages:,        }")
+
     return total_messages
-        
-    #move_messages_to_folder(server, messages, "Inbox", "Pre Trash", True, CHUNK_SIZE, True, 2000)
+
+    # move_messages_to_folder(server, messages, "Inbox", "Pre Trash", True,
+    # CHUNK_SIZE, True, 2000)
 
 
 def preview_unsubscribe_emails(server, inbox_candidates):
@@ -479,10 +608,16 @@ def get_folder_uidnext(server, folder_name):
 
 
 def find_unsubscribe_message_ids(server, folder_name=None):
-  return search_in_uid_ranges(server, ["TEXT", "unsubscribe"], chunk_size=CHUNK_SIZE, folder_name=folder_name)
+  return search_in_uid_ranges(
+    server, [
+        "TEXT", "unsubscribe"], chunk_size=CHUNK_SIZE, folder_name=folder_name)
 
 
-def search_in_uid_ranges(server, search_criteria, chunk_size=CHUNK_SIZE, folder_name=None):
+def search_in_uid_ranges(
+    server,
+    search_criteria,
+    chunk_size=CHUNK_SIZE,
+     folder_name=None):
   messages = []
   start = 1
   uidnext = None
@@ -519,12 +654,12 @@ def search_in_uid_ranges(server, search_criteria, chunk_size=CHUNK_SIZE, folder_
         break
 
     start = end + 1
- 
 
   return sorted(set(messages))
 
 
-def get_folder_status_using_uid_pagination(server, folder_name, chunk_size=10000):
+def get_folder_status_using_uid_pagination(
+    server, folder_name, chunk_size=10000):
   total = 0
   start = 1
   uidnext = None
@@ -564,29 +699,31 @@ def get_folder_statuss(server, folder_name):
   total = 0
   unread = 0
 
-  if True: #folder_name.lower() == "inbox":
+  if True:  # folder_name.lower() == "inbox":
       try:
 
-        print(f"Scanning folder {folder_name} for total and unread counts...", flush=True)
+        print(
+    f"Scanning folder {folder_name} for total and unread counts...",
+     flush=True)
         # Use folder_status to fetch counts instantly (No regex needed!)
         # Pass the folder name and a list/tuple of status keys
-        status = server.folder_status(folder_name, ["MESSAGES", "UNSEEN"]) #"INBOX"
-        
+        status = server.folder_status(
+            folder_name, ["MESSAGES", "UNSEEN"])  # "INBOX"
+
         # IMAPClient automatically parses the response into a clean dictionary
         total = status[b"MESSAGES"]
         unread = status[b"UNSEEN"]
-        
-        print(f"Folder: {folder_name}, Total: {total:,}, Unread: {unread :,}")
 
-        #select_info = server.select_folder(folder_name, readonly=True)
-        #total = _status_value(select_info, "EXISTS")
+        print(f"Folder: {folder_name}, Total: {total:,}, Unread: {unread:,}")
+
+        # select_info = server.select_folder(folder_name, readonly=True)
+        # total = _status_value(select_info, "EXISTS")
       except Exception:
         total = -1
         unread = -1
 
       return total, unread
- 
- 
+
   try:
     status = server.folder_status(folder_name, ["MESSAGES"])
     total = _status_value(status, "MESSAGES")
@@ -615,14 +752,16 @@ def get_folder_statuss(server, folder_name):
   return total, unread
 
 
-def preview_unsubscribe_emails_with_trash(server, inbox_candidates, trash_folder):
+def preview_unsubscribe_emails_with_trash(
+    server, inbox_candidates, trash_folder):
   # select inbox and show total inbox count
   selected_folder = select_inbox_folder(server, inbox_candidates)
   print(f"Selected folder: {selected_folder}")
 
   inbox_total = get_folder_status(server, selected_folder)
   if inbox_total is None:
-    print(f"Unable to determine total messages in Inbox folder '{selected_folder}'.")
+    print(
+    f"Unable to determine total messages in Inbox folder '{selected_folder}'.")
   else:
     print(f"Total messages in {selected_folder}: {inbox_total}")
 
@@ -637,7 +776,8 @@ def preview_unsubscribe_emails_with_trash(server, inbox_candidates, trash_folder
   # show current Trash count (heads-up)
   trash_count = get_folder_status(server, trash_folder)
   if trash_count is None:
-    print(f"Unable to determine message count for Trash folder '{trash_folder}'.")
+    print(
+    f"Unable to determine message count for Trash folder '{trash_folder}'.")
   else:
     print(f"Current messages in {trash_folder}: {trash_count}")
 
@@ -653,43 +793,44 @@ def summarize_folders(server):
   for flags, delimiter, folder_name in folders:
     try:
       total, unread = get_folder_statuss(server, folder_name)
-      unsubscribe_count=-2
-      #unsubscribe_count = len(search_in_uid_ranges(server, ["TEXT", "unsubscribe"], folder_name=folder_name))
+      unsubscribe_count = -2
+      # unsubscribe_count = len(search_in_uid_ranges(server, ["TEXT",
+      # "unsubscribe"], folder_name=folder_name))
       print(
         f"Folder: {folder_name} | Total: {total} | Unread: {unread} | Unsubscribe: {unsubscribe_count}"
       )
-      # Critical safety pause to stay under Yahoo's command-frequency firewall thresholds
+      # Critical safety pause to stay under Yahoo's command-frequency firewall
+      # thresholds
       time.sleep(PAUSE_BETWEEN_CHUNKS)
     except Exception as e:
       print(f"Skipping {folder_name}: {e}")
-
 
 
 # Safety Settings for Deletion
 DELETE_CHUNK_SIZE = 2000
 PAUSE_BETWEEN_DELETES = 1.0
 
-def  empty_trash_folder2(server, trash_folder):
+
+def empty_trash_folder2(server, trash_folder):
     """
-    Safely purges the Trash folder in manageable blocks to prevent 
+    Safely purges the Trash folder in manageable blocks to prevent
     Yahoo connection bans while permanently wiping out storage space.
     """
-  
 
     try:
-        
+
         # 1. Open the Trash folder in read/write mode
         server.select_folder(trash_folder, readonly=False)
         print(f"\nOpened {trash_folder} for permanent purging...")
-        
+
         # 2. Get all message UIDs currently residing in the Trash
         # Using ['ALL'] here is safe because we aren't performing a heavy text search,
         # we are just grabbing the raw tracking pointers.
         trash_uids = server.search(['ALL'])
         total_in_trash = len(trash_uids)
-        
+
         print(f"Found {total_in_trash:,} messages waiting in {trash_folder}.")
-        
+
         if total_in_trash == 0:
             print("Trash folder is already empty.")
             return 0
@@ -698,33 +839,37 @@ def  empty_trash_folder2(server, trash_folder):
         if confirmation != "Yes":
           print("Aborting empty action.")
           return 0
-        
+
         # 3. Loop through the Trash UIDs in safe chunks
-        print(f"Beginning permanent purge (Chunk Size: {DELETE_CHUNK_SIZE})...")
+        print(
+    f"Beginning permanent purge (Chunk Size: {DELETE_CHUNK_SIZE})...")
         for i in range(0, total_in_trash, DELETE_CHUNK_SIZE):
             chunk = trash_uids[i:i + DELETE_CHUNK_SIZE]
-            
+
             # Step A: Add the system deletion flag to this specific batch
             server.add_flags(chunk, [b'\\Deleted'])
-            
+
             # Step B: Tell Yahoo to immediately erase anything marked with \\Deleted
             # This physically frees up the storage space on Yahoo's server
             server.expunge()
-            
-            print(f" -> Permanently deleted batch starting at index {i:,} ({len(chunk)} emails)")
-            
+
+            print(
+                f" -> Permanently deleted batch starting at index {i:,} ({len(chunk)} emails)")
+
             # Anti-ban rest window
             time.sleep(PAUSE_BETWEEN_DELETES)
-            
-        print(f"🏁 Done! The {trash_folder} folder has been permanently emptied.")
+
+        print(
+    f"🏁 Done! The {trash_folder} folder has been permanently emptied.")
         return total_in_trash
-    
+
     except Exception as e:
         print(f"An error occurred while emptying trash: {e}")
 
 
 def print_usage():
-  print("Usage: python emailtaxmenot.py <youremail@domain.com> <action> [limit] [before|since] <DD-MMM-YYYY> <keep folder 1> <keep criteria 1> ... <keep folder N> <keep criteria N>")
+  print(
+      "Usage: python emailtaxmenot.py <youremail@domain.com> <action> [limit] [before|since] <DD-MMM-YYYY> <keep folder 1> <keep criteria 1> ... <keep folder N> <keep criteria N>")
   print(" <youremail@domain.com> The email address of the account to be cleaned. You will be prompted for an app password if not set in the YAHOO_APP_PASSWORD environment variable.")
   print(" [limit] sets the maximum number of messages to move. Set to 0 for unlimited. ")
   print(
@@ -765,17 +910,17 @@ def print_usage():
         "  You can specify as many folder and criteria pairs as you like. "
         )
   print(" Keep folder: the folder to move matching emails into from Pre Trash, "
-        "            based on the keep critera that follows\n" )
+        "            based on the keep critera that follows\n")
   print("    If the folder does not exist, it will be created. ")
   print(" Keep criteria:")
   print("  from -  keep emails from a specific sender (e.g., 'from:sender@example.com')")
   print("  to -  keep emails to a specific email, such as a distribution list you are on (e.g., 'to:myreadinggroup@example.com')")
-  print("  subject - keep emails with a specific subject (e.g., 'subject:Newsletter')") 
-  print("  body - keep emails with a specific subject (e.g., 'body:phrase to match')") 
+  print("  subject - keep emails with a specific subject (e.g., 'subject:Newsletter')")
+  print("  body - keep emails with a specific subject (e.g., 'body:phrase to match')")
   print(" Example -  ")
   print("  python emailtaxmenot.py <youremail@domain.com> \\ \n"
         "  clean 1000  before \"01-Jan-2020\" \\ \n"
-        " \"Friends\" \"from:amymyfriend@example.com\" \\ \n" 
+        " \"Friends\" \"from:amymyfriend@example.com\" \\ \n"
         " \"Friends\" \"from:bobmyfriend@theirdomain.com\" \\ \n"
         " \"Family\" \"from:mysister@gmailer.com\" \\ \n"
         " \"Work\" \"to:myworkgroup@mywork.com\" \\ \n"
@@ -789,8 +934,6 @@ def print_usage():
   print("  empty   - permanently removes and deletes all messages in Trash")
   print("  summary - list all folders with total, unread, and unsubscribe counts")
 
-import argparse
-import sys
 
 def parse_keep_groups(tokens):
     groups = []
@@ -828,187 +971,169 @@ def parse_keep_groups(tokens):
 
     return groups
 
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Email cleanup tool")
     parser.add_argument("--action", required=True,
-                        choices=["preview", "clean", "trash", "empty", "purge", "summary"])
-    parser.add_argument("--email", required=True, help="Email address to clean")
-    parser.add_argument("--limit", type=int, default=0,
+                        choices=["preview", "keep", "clean", "trash", "empty", "purge", "summary"])
+    parser.add_argument(
+    "--email",
+    required=True,
+     help="Email address to clean")
+    
+    parser.add_argument(
+      "--dry-run",
+      action="store_true",
+      help="Parse args and show planned actions without modifying mailboxes"
+)
+    parser.add_argument("--limit", type=int, default=None,
                         help="Maximum number of messages to move (0 = unlimited)")
     parser.add_argument("--since", help="Date filter since DD-MMM-YYYY")
     parser.add_argument("--before", help="Date filter before DD-MMM-YYYY")
     return parser
 
-def new_main(argv=None):
-    argv = argv or sys.argv[1:]
-    parser = build_parser()
-
-    known_args, remaining = parser.parse_known_args(argv)
-    keep_blocks = parse_keep_groups(remaining)
-
-    print("global args:", vars(known_args))
-    print("keep blocks:", keep_blocks)
-
-    # Example: build criteria for each keep block
-    for block in keep_blocks:
-        criteria = []
-        if block["criteria"].get("from"):
-            criteria += ["FROM", block["criteria"]["from"]]
-        if block["criteria"].get("subject"):
-            criteria += ["SUBJECT", block["criteria"]["subject"]]
-        if block["criteria"].get("body"):
-            criteria += ["BODY", block["criteria"]["body"]]
-        if block["criteria"].get("to"):
-            criteria += ["TO", block["criteria"]["to"]]
-
-        print("folder:", block["to_folder"], "criteria:", criteria)
-
-
+import shlex
 
 def main(argv=None):
-    argv = argv or sys.argv[1:]
-    parser = build_parser()
+  argv = argv or sys.argv[1:]
+  parser = build_parser()
 
-    known_args, remaining = parser.parse_known_args(argv)
-    keep_blocks = parse_keep_groups(remaining)
+  cmd = shlex.join([sys.argv[0]] + argv)
+  print(f"Dry run command:\n\t{cmd}\n\n")
 
-    print("global args:", vars(known_args))
-    print("keep blocks:", keep_blocks)
+  known_args, remaining = parser.parse_known_args(argv)
+  keep_blocks = parse_keep_groups(remaining)
 
-    # Example: build criteria for each keep block
-    for block in keep_blocks:
-        criteria = []
-        if block["criteria"].get("from"):
-            criteria += ["FROM", block["criteria"]["from"]]
-        if block["criteria"].get("subject"):
-            criteria += ["SUBJECT", block["criteria"]["subject"]]
-        if block["criteria"].get("body"):
-            criteria += ["BODY", block["criteria"]["body"]]
-        if block["criteria"].get("to"):
-            criteria += ["TO", block["criteria"]["to"]]
+  print("global args:", vars(known_args))
+  print("keep blocks:", keep_blocks)
 
-        print("folder:", block["to_folder"], "criteria:", criteria)
+  action = known_args.action
+  if action not in {"preview","keep", "clean","trash", "empty", "purge","summary"}:
+    print(f"Unknown action: {action}")
+    print_usage()
+    sys.exit(1)
 
-    action = known_args.action
-    email = known_args.email.lower()
+  email = known_args.email.lower()
+  limit = known_args.limit
+  since_value = known_args.since
+  before_value = known_args.before
 
-    try:
-      config = get_account_config(email)
-    except ValueError as error:
-      print(error)
-      sys.exit(1)
+  print(f"main(): \n\taction: {action} \n\temail:{email} \n\tlimit:{limit} \n\tsince_value: {since_value} \n\tbefore_value: {before_value}")
 
-    # Handle date flags and limits for clean/purge
-    date_filter = None
-    date_value = None
-    limit = known_args.limit if known_args.limit is not None else 0
+  keep_criteria=[]
+  # Example: build criteria for each keep block
+  for block in keep_blocks:
+      criteria = []
+      block_criteria = {}
+      if block["criteria"].get("from"):
+          criteria += ["FROM", block["criteria"]["from"]]
+      if block["criteria"].get("subject"):
+          criteria += ["SUBJECT", block["criteria"]["subject"]]
+      if block["criteria"].get("body"):
+          criteria += ["BODY", block["criteria"]["body"]]
+      if block["criteria"].get("to"):
+          criteria += ["TO", block["criteria"]["to"]]
 
-    if action in ["clean", "purge"]:
-      # require a limit argument (0 means unlimited is allowed)
-      if limit is None:
-        print("The clean or purge action requires a --limit argument (0 = unlimited).")
-        print_usage()
-        sys.exit(1)
+      if not block.get("to_folder"):
+        print("Skipping keep block without to_folder")
+        continue
+      if  len(criteria) < 1:
+        print(f"Skipping {block.get("to_folder")}: no search criteria")
+        continue
+      block_criteria["to_folder"] = block["to_folder"]
+      block_criteria["search_criteria"] = criteria
+      keep_criteria.append(block_criteria)
+      print("folder:", block["to_folder"], "search_criteria:", criteria)
 
-      if known_args.since and known_args.before:
-        print("Please specify only one of --since or --before.")
-        print_usage()
-        sys.exit(1)
+  print(f"keep_criteria: {keep_criteria}")
 
-      if not known_args.since and not known_args.before:
-        print("The clean or purge action requires a date filter: --since or --before.")
-        print_usage()
-        sys.exit(1)
 
-      if known_args.since:
-        date_filter = "since"
-        date_value = known_args.since
-      else:
-        date_filter = "before"
-        date_value = known_args.before
+  if known_args.dry_run:
+    print(f"\n==============End Dry Run ==================== ")
+    return(0);
 
-      if not is_valid_date(date_value, "%d-%b-%Y"):
-        print("Invalid date value. Use DD-MMM-YYYY format (eg 01-Jan-2020).")
-        print_usage()
-        sys.exit(1)
+  try:
+    config = get_account_config(email)
+  except ValueError as error:
+    print(error)
+    return(1)
+
+
+  if action in ["clean", "purge"]:
+    if  (limit is  None or (since_value is  None and before_value is None)):
+      print("The clean or purge action requires a limit arg and a date before or since specification.")
+      print_usage() 
+      return(1)
+
+
+    if limit <= 0:
+      limit = None  # Treat 0 or negative as unlimited
+
+
+    date_value = since_value
+    date_filter = 'SINCE'
+    if before_value:
+      date_value = before_value
+      date_filter = 'BEFORE'
+
+    if not is_valid_date(date_value, "%d-%b-%Y"):
+      print("Invalid date value. Use DD-MMM-YYYY format (eg 01-Jan-2020).")
+      print_usage()
+      return(1)
+
+    
+
+    
+  else:  
+    if limit or since_value or before_value:
+      print("The preview, summary and empty actions do not accept a limit argument or any other criteria.")
+      print_usage()
+      return(1)
+
+  try:
+    server =  login_to_imap(email, config["imap_server_read"], config["imap_port_read"])
+    if action == "preview":
+      preview_unsubscribe_emails_with_trash(server, config["inbox"], config["trash"])
+    elif action == "trash":
+      while True:
+        total_moved = move_all_folder_messages(server, "Pre Trash", config["trash"])
+        if total_moved == 0:
+          break
+    elif action == "keep":
+      while True:
+        total_moved = move_specified_messages(server, "Pre Trash", keep_criteria)
+        if total_moved == 0:
+          break
+    elif action == "clean":
+      remaining_limit = limit
+      while True:
+        moved_count = move_unsubscribe_emails_to_trash2(
+          server,
+          config["inbox"],
+          "Pre Trash",
+          remaining_limit,
+          date_filter,
+          date_value,
+          keep_criteria
+        )
+        if moved_count == 0:
+          break
+        if limit is not None:
+          remaining_limit -= moved_count
+          if remaining_limit <= 0:
+            break
+    elif action == "summary":
+      summarize_folders(server)
     else:
-      # preview, summary, empty and trash should not receive date flags
-      if known_args.since or known_args.before or known_args.limit:
-        if action in {"preview", "summary", "empty"} and (known_args.since or known_args.before or (known_args.limit and known_args.limit != 0)):
-          print("The preview, summary and empty actions do not accept a limit or date arguments.")
-          print_usage()
-          sys.exit(1)
+      while True:
+        total_deleted = empty_trash_folder2(server, config["trash"])
+        if total_deleted == 0:
+          break
 
-    try:
-      server = login_to_imap(email, config["imap_server_read"], config["imap_port_read"])
-
-      if action == "preview":
-        preview_unsubscribe_emails_with_trash(server, config["inbox"], config["trash"])
-
-      elif action == "trash":
-        while True:
-          total_moved = move_all_folder_messages(server, "Pre Trash", config["trash"]) 
-          if total_moved == 0:
-            break
-
-      elif action == "clean":
-        remaining_limit = None if limit == 0 else limit
-        while True:
-          moved_count = move_unsubscribe_emails_to_trash2(
-            server,
-            config["inbox"],
-            "Pre Trash",
-            remaining_limit,
-            date_filter,
-            date_value,
-            keep_criteria,
-          )
-          if moved_count == 0:
-            break
-          if limit is not None and limit != 0:
-            break
-
-      elif action == "summary":
-        summarize_folders(server)
-
-      elif action == "purge":
-        # purge = clean, then trash, then empty
-        remaining_limit = None if limit == 0 else limit
-        while True:
-          moved_count = move_unsubscribe_emails_to_trash2(
-            server,
-            config["inbox"],
-            "Pre Trash",
-            remaining_limit,
-            date_filter,
-            date_value,
-            keep_criteria,
-          )
-          if moved_count == 0:
-            break
-          if limit is not None and limit != 0:
-            break
-
-        while True:
-          total_moved = move_all_folder_messages(server, "Pre Trash", config["trash"]) 
-          if total_moved == 0:
-            break
-
-        while True:
-          total_deleted = empty_trash_folder2(server, config["trash"]) 
-          if total_deleted == 0:
-            break
-
-      else:  # empty
-        while True:
-          total_deleted = empty_trash_folder2(server, config["trash"]) 
-          if total_deleted == 0:
-            break
-
-    except Exception as error:
-      print(f"\nUhoh! An exception occurred: {error}")
-      traceback.print_exc()
-      sys.exit(1)
+  except Exception as error:
+    print(f"\nUhoh! An exception occurred: {error}")
+    traceback.print_exc()
+    sys.exit(1)
 
 
 if __name__ == "__main__":

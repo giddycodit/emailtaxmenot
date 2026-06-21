@@ -1,0 +1,115 @@
+Dry run command:
+	emailtaxmenot.py --dry-run --action keep --email youremail@yahoo.com --keep --to_folder Friends --from friend@example.com
+
+
+global args: {'action': 'keep', 'email': 'youremail@yahoo.com', 'dry_run': True, 'limit': None, 'since': None, 'before': None}
+keep blocks: [{'to_folder': 'Friends', 'criteria': {'from': 'friend@example.com'}}]
+main(): 
+	action: keep 
+	email:youremail@yahoo.com 
+	limit:None 
+	since_value: None 
+	before_value: None
+folder: Friends search_criteria: ['FROM', 'friend@example.com']
+keep_criteria: [{'to_folder': 'Friends', 'search_criteria': ['FROM', 'friend@example.com']}]
+
+==============End Dry Run ==================== 
+Dry run command:
+	emailtaxmenot.py --dry-run --action keep --email youremail@yahoo.com --keep --to_folder Friends --from friend@example.com --subject 'Weekly Update' --keep --to_folder Work --to workgroup@example.com
+
+
+global args: {'action': 'keep', 'email': 'youremail@yahoo.com', 'dry_run': True, 'limit': None, 'since': None, 'before': None}
+keep blocks: [{'to_folder': 'Friends', 'criteria': {'from': 'friend@example.com', 'subject': 'Weekly Update'}}, {'to_folder': 'Work', 'criteria': {'to': 'workgroup@example.com'}}]
+main(): 
+	action: keep 
+	email:youremail@yahoo.com 
+	limit:None 
+	since_value: None 
+	before_value: None
+folder: Friends search_criteria: ['FROM', 'friend@example.com', 'SUBJECT', 'Weekly Update']
+folder: Work search_criteria: ['TO', 'workgroup@example.com']
+keep_criteria: [{'to_folder': 'Friends', 'search_criteria': ['FROM', 'friend@example.com', 'SUBJECT', 'Weekly Update']}, {'to_folder': 'Work', 'search_criteria': ['TO', 'workgroup@example.com']}]
+
+==============End Dry Run ==================== 
+Dry run command:
+	emailtaxmenot.py --dry-run --action keep --email youremail@yahoo.com --keep --to_folder Equestrian --body equestrian
+
+
+global args: {'action': 'keep', 'email': 'youremail@yahoo.com', 'dry_run': True, 'limit': None, 'since': None, 'before': None}
+keep blocks: [{'to_folder': 'Equestrian', 'criteria': {'body': 'equestrian'}}]
+main(): 
+	action: keep 
+	email:youremail@yahoo.com 
+	limit:None 
+	since_value: None 
+	before_value: None
+folder: Equestrian search_criteria: ['BODY', 'equestrian']
+keep_criteria: [{'to_folder': 'Equestrian', 'search_criteria': ['BODY', 'equestrian']}]
+
+==============End Dry Run ==================== 
+Dry run command:
+	emailtaxmenot.py --dry-run --action keep --email youremail@yahoo.com --keep --to_folder Equestrian --body horse
+
+
+global args: {'action': 'keep', 'email': 'youremail@yahoo.com', 'dry_run': True, 'limit': None, 'since': None, 'before': None}
+keep blocks: [{'to_folder': 'Equestrian', 'criteria': {'body': 'horse'}}]
+main(): 
+	action: keep 
+	email:youremail@yahoo.com 
+	limit:None 
+	since_value: None 
+	before_value: None
+folder: Equestrian search_criteria: ['BODY', 'horse']
+keep_criteria: [{'to_folder': 'Equestrian', 'search_criteria': ['BODY', 'horse']}]
+
+==============End Dry Run ==================== 
+Dry run command:
+	emailtaxmenot.py --dry-run --action clean --email youremail@yahoo.com --limit 1000 --before 01-Jan-2020 --keep --to_folder Friends --from friend@example.com --keep --to_folder Work --subject Project
+
+
+global args: {'action': 'clean', 'email': 'youremail@yahoo.com', 'dry_run': True, 'limit': 1000, 'since': None, 'before': '01-Jan-2020'}
+keep blocks: [{'to_folder': 'Friends', 'criteria': {'from': 'friend@example.com'}}, {'to_folder': 'Work', 'criteria': {'subject': 'Project'}}]
+main(): 
+	action: clean 
+	email:youremail@yahoo.com 
+	limit:1000 
+	since_value: None 
+	before_value: 01-Jan-2020
+folder: Friends search_criteria: ['FROM', 'friend@example.com']
+folder: Work search_criteria: ['SUBJECT', 'Project']
+keep_criteria: [{'to_folder': 'Friends', 'search_criteria': ['FROM', 'friend@example.com']}, {'to_folder': 'Work', 'search_criteria': ['SUBJECT', 'Project']}]
+
+==============End Dry Run ==================== 
+Dry run command:
+	emailtaxmenot.py --dry-run --action clean --email youremail@yahoo.com --limit 500 --since 01-Jan-2024 --keep --to_folder Important --to boss@example.com
+
+
+global args: {'action': 'clean', 'email': 'youremail@yahoo.com', 'dry_run': True, 'limit': 500, 'since': '01-Jan-2024', 'before': None}
+keep blocks: [{'to_folder': 'Important', 'criteria': {'to': 'boss@example.com'}}]
+main(): 
+	action: clean 
+	email:youremail@yahoo.com 
+	limit:500 
+	since_value: 01-Jan-2024 
+	before_value: None
+folder: Important search_criteria: ['TO', 'boss@example.com']
+keep_criteria: [{'to_folder': 'Important', 'search_criteria': ['TO', 'boss@example.com']}]
+
+==============End Dry Run ==================== 
+Dry run command:
+	emailtaxmenot.py --dry-run --action purge --email youremail@yahoo.com --limit 1000 --before 01-Jan-2020 --keep --to_folder Friends --from friend@example.com --keep --to_folder Personal --subject Family
+
+
+global args: {'action': 'purge', 'email': 'youremail@yahoo.com', 'dry_run': True, 'limit': 1000, 'since': None, 'before': '01-Jan-2020'}
+keep blocks: [{'to_folder': 'Friends', 'criteria': {'from': 'friend@example.com'}}, {'to_folder': 'Personal', 'criteria': {'subject': 'Family'}}]
+main(): 
+	action: purge 
+	email:youremail@yahoo.com 
+	limit:1000 
+	since_value: None 
+	before_value: 01-Jan-2020
+folder: Friends search_criteria: ['FROM', 'friend@example.com']
+folder: Personal search_criteria: ['SUBJECT', 'Family']
+keep_criteria: [{'to_folder': 'Friends', 'search_criteria': ['FROM', 'friend@example.com']}, {'to_folder': 'Personal', 'search_criteria': ['SUBJECT', 'Family']}]
+
+==============End Dry Run ==================== 

@@ -695,7 +695,7 @@ def summarize_folders(server):
   print(f"Found {len(folders)} folders. Scanning each folder...")
   for flags, delimiter, folder_name in folders:
     try:
-      total, unread = get_folder_statuss(server, folder_name)
+      total, unread = get_folder_status(server, folder_name)
       unsubscribe_count=-2
       #unsubscribe_count = len(search_in_uid_ranges(server, ["TEXT", "unsubscribe"], folder_name=folder_name))
       print(
